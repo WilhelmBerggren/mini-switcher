@@ -1,6 +1,17 @@
 import Cocoa
 import Carbon
 
+// Private SkyLight symbol — always resident because NSApplication loads the framework.
+// Disables/enables symbolic hotkeys (⌘Tab = 1, ⌘Shift+Tab = 2) system-wide.
+// IMPORTANT: the effect persists after the process exits, so we must restore on quit/signal.
+@_silgen_name("CGSSetSymbolicHotKeyEnabled") @discardableResult
+func CGSSetSymbolicHotKeyEnabled(_ hotKey: Int, _ isEnabled: Bool) -> Int32
+
+func setSystemCmdTab(enabled: Bool) {
+    CGSSetSymbolicHotKeyEnabled(1, enabled) // ⌘Tab
+    CGSSetSymbolicHotKeyEnabled(2, enabled) // ⌘Shift+Tab
+}
+
 // MARK: - Model
 
 struct WindowInfo {
@@ -36,7 +47,6 @@ func fetchWindows() -> [WindowInfo] {
 // MARK: - Window Activation
 
 func raiseWindow(_ w: WindowInfo) {
-    // Try to bring the specific window to front via Accessibility
     let axApp = AXUIElementCreateApplication(w.pid)
     var ref: CFTypeRef?
     if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
@@ -125,7 +135,7 @@ final class SwitcherPanel: NSPanel {
         table.dataSource = self
         table.delegate = self
         table.target = self
-        table.doubleAction = #selector(commitSelection)
+        table.doubleAction = #selector(commitAndClose)
 
         let scroll = NSScrollView()
         scroll.documentView = table
@@ -142,44 +152,49 @@ final class SwitcherPanel: NSPanel {
         contentView = fx
     }
 
-    func present() {
+    // selectIndex 1 = macOS convention: start on previously-used window
+    func present(selectIndex: Int = 0) {
         windows = fetchWindows()
         guard !windows.isEmpty else { return }
         table.reloadData()
-        table.selectRowIndexes([0], byExtendingSelection: false)
-
+        let row = min(selectIndex, windows.count - 1)
+        table.selectRowIndexes([row], byExtendingSelection: false)
+        table.scrollRowToVisible(row)
         let rowsVisible = min(windows.count, 14)
         setContentSize(NSSize(width: 560, height: CGFloat(rowsVisible) * table.rowHeight + 12))
         center()
         makeKeyAndOrderFront(nil)
     }
 
+    func selectNext() {
+        let row = min(windows.count - 1, table.selectedRow + 1)
+        table.selectRowIndexes([row], byExtendingSelection: false)
+        table.scrollRowToVisible(row)
+    }
+
+    func selectPrevious() {
+        let row = max(0, table.selectedRow - 1)
+        table.selectRowIndexes([row], byExtendingSelection: false)
+        table.scrollRowToVisible(row)
+    }
+
+    @objc func commitAndClose() {
+        let row = table.selectedRow
+        orderOut(nil)
+        guard row >= 0, row < windows.count else { return }
+        raiseWindow(windows[row])
+    }
+
     override var canBecomeKey: Bool { true }
 
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
-        case kVK_Escape:
-            orderOut(nil)
-        case kVK_Return:
-            commitSelection()
-        case kVK_UpArrow:
-            let row = max(0, table.selectedRow - 1)
-            table.selectRowIndexes([row], byExtendingSelection: false)
-            table.scrollRowToVisible(row)
-        case kVK_DownArrow:
-            let row = min(windows.count - 1, table.selectedRow + 1)
-            table.selectRowIndexes([row], byExtendingSelection: false)
-            table.scrollRowToVisible(row)
-        default:
-            super.keyDown(with: event)
+        case kVK_Escape:    orderOut(nil)
+        case kVK_Return:    commitAndClose()
+        case kVK_UpArrow:   selectPrevious()
+        case kVK_DownArrow: selectNext()
+        default:            super.keyDown(with: event)
         }
-    }
-
-    @objc private func commitSelection() {
-        let row = table.selectedRow
-        guard row >= 0, row < windows.count else { return }
-        orderOut(nil)
-        raiseWindow(windows[row])
     }
 }
 
@@ -200,34 +215,150 @@ extension SwitcherPanel: NSTableViewDelegate {
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var hotKeyRef: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
+    // Statics accessed by @convention(c) callbacks
+    static var shared: AppDelegate!
+    static var cmdIsDown = false
+    static var eventTap: CFMachPort?
+    static var hotKeyRef: EventHotKeyRef?
+    static var hotKeyRefBack: EventHotKeyRef?
+    static var hotKeyHandlerRef: EventHandlerRef?
+
     private let panel = SwitcherPanel()
+    private var statusItem: NSStatusItem!
+    private var runLoopSource: CFRunLoopSource?
+
+    // CGEvent tap callback: handles only flagsChanged (Cmd release → close panel)
+    // and re-enables the tap if macOS disables it. @convention(c) compatible: no captures.
+    private static let tapCallback: CGEventTapCallBack = { _, type, cgEvent, _ in
+        switch type {
+        case .flagsChanged:
+            let cmdNow = cgEvent.flags.contains(.maskCommand)
+            DispatchQueue.main.async {
+                let wasDown = AppDelegate.cmdIsDown
+                AppDelegate.cmdIsDown = cmdNow
+                if wasDown && !cmdNow && AppDelegate.shared.panel.isVisible {
+                    AppDelegate.shared.panel.commitAndClose()
+                }
+            }
+            return Unmanaged.passUnretained(cgEvent)
+        case .tapDisabledByUserInput, .tapDisabledByTimeout:
+            if let tap = AppDelegate.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(cgEvent)
+        default:
+            return Unmanaged.passUnretained(cgEvent)
+        }
+    }
 
     func applicationDidFinishLaunching(_: Notification) {
+        AppDelegate.shared = self
         NSApp.setActivationPolicy(.accessory)
+        setupMenuBar()
         requestAccessibility()
-        registerHotKey()
+        // Disable the system ⌘Tab switcher so our Carbon hotkey can take over.
+        // Must be restored on exit — the effect persists across process restarts.
+        setSystemCmdTab(enabled: false)
+        setupHotKeys()
+        setupEventTap()
+        installSignalHandlers()
     }
 
-    func togglePanel() {
-        panel.isVisible ? panel.orderOut(nil) : panel.present()
+    func applicationWillTerminate(_: Notification) {
+        setSystemCmdTab(enabled: true)
     }
 
-    private func registerHotKey() {
-        let id = EventHotKeyID(signature: 0x4D534E57, id: 1)
+    // Called from the Carbon hotkey handler on the main thread.
+    // id 1 = ⌘Tab (forward), id 2 = ⌘Shift+Tab (backward).
+    func handleHotKey(id: UInt32) {
+        if panel.isVisible {
+            id == 1 ? panel.selectNext() : panel.selectPrevious()
+        } else {
+            // Start at index 1 so the first press selects the previously used window,
+            // matching macOS ⌘Tab convention. Backward starts at the end of the list.
+            panel.present(selectIndex: id == 2 ? Int.max : 1)
+        }
+    }
+
+    private func setupHotKeys() {
+        // GetEventDispatcherTarget registers at the lowest Carbon level, which beats
+        // the Dock's own ⌘Tab handler. GetApplicationEventTarget would lose that race.
+        let target = GetEventDispatcherTarget()
+
         var spec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
+            eventKind: OSType(kEventHotKeyPressed)
         )
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, ctx -> OSStatus in
-            Unmanaged<AppDelegate>.fromOpaque(ctx!).takeUnretainedValue().togglePanel()
+        InstallEventHandler(target, { _, event, _ -> OSStatus in
+            var id = EventHotKeyID()
+            GetEventParameter(event,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+            let hotKeyID = id.id
+            DispatchQueue.main.async { AppDelegate.shared.handleHotKey(id: hotKeyID) }
             return noErr
-        }, 1, &spec, ctx, &handlerRef)
-        // ⌥Tab: kVK_Tab = 48, optionKey modifier = 2048
-        RegisterEventHotKey(UInt32(kVK_Tab), UInt32(optionKey), id,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
+        }, 1, &spec, nil, &AppDelegate.hotKeyHandlerRef)
+
+        let sig: OSType = 0x4D534E57
+        // ⌘Tab (forward, id 1)
+        let fwdID = EventHotKeyID(signature: sig, id: 1)
+        RegisterEventHotKey(UInt32(kVK_Tab), UInt32(cmdKey),
+                            fwdID, target, 0, &AppDelegate.hotKeyRef)
+        // ⌘Shift+Tab (backward, id 2)
+        let bwdID = EventHotKeyID(signature: sig, id: 2)
+        RegisterEventHotKey(UInt32(kVK_Tab), UInt32(cmdKey | shiftKey),
+                            bwdID, target, 0, &AppDelegate.hotKeyRefBack)
+    }
+
+    private func setupEventTap() {
+        // Tap only needs flagsChanged to detect when Cmd is released while panel is showing.
+        // Requires Accessibility permission; if unavailable, panel must be closed manually.
+        let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: AppDelegate.tapCallback,
+            userInfo: nil
+        ) else {
+            print("CGEvent tap failed — grant Accessibility in System Settings, then restart")
+            return
+        }
+        AppDelegate.eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func setupMenuBar() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "rectangle.2.swap",
+            accessibilityDescription: "Window Switcher"
+        )
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(
+            title: "Show Window Switcher", action: #selector(showPanel), keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Quit MiniSwitcher",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        ))
+        statusItem.menu = menu
+    }
+
+    @objc private func showPanel() { panel.present() }
+
+    private func installSignalHandlers() {
+        // Restore system ⌘Tab if the process is killed, so it doesn't stay disabled permanently.
+        let handler: @convention(c) (Int32) -> Void = { _ in
+            setSystemCmdTab(enabled: true)
+            exit(0)
+        }
+        signal(SIGTERM, handler)
+        signal(SIGINT,  handler)
     }
 
     private func requestAccessibility() {
