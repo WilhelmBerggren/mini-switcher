@@ -166,6 +166,23 @@ final class WindowCell: NSTableCellView {
     }
 }
 
+// MARK: - Row View
+
+// The .plain table style draws a full-width rectangular selection. This restores the
+// rounded, inset highlight the default (inset) style gave — without its phantom row padding.
+final class WindowRowView: NSTableRowView {
+    static let id = NSUserInterfaceItemIdentifier("WindowRow")
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        let rect = bounds.insetBy(dx: 4, dy: 2)
+        let color = isEmphasized ? NSColor.selectedContentBackgroundColor
+                                 : NSColor.unemphasizedSelectedContentBackgroundColor
+        color.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+    }
+}
+
 // MARK: - Hover-Tracking Table
 
 // Selects the row under the cursor as the mouse moves, so hover-then-commit
@@ -191,6 +208,9 @@ final class HoverTableView: NSTableView {
 // MARK: - Switcher Panel
 
 final class SwitcherPanel: NSPanel {
+    private static let padding: CGFloat = 6      // equal gap above first / below last row
+    private static let maxVisibleRows = 14       // cap height; rows beyond this scroll
+
     private let table = HoverTableView()
     private var windows: [WindowInfo] = []
 
@@ -226,6 +246,9 @@ final class SwitcherPanel: NSPanel {
         table.addTableColumn(col)
         table.headerView = nil
         table.backgroundColor = .clear
+        // .automatic resolves to an inset style on macOS 11+, which pads the document
+        // view taller than its rows and leaves a scrollable overflow that clips a row.
+        table.style = .plain
         table.rowHeight = 36
         table.intercellSpacing = .zero
         table.dataSource = self
@@ -238,13 +261,16 @@ final class SwitcherPanel: NSPanel {
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = false
+        // Otherwise AppKit adds a phantom top inset that shifts rows down and clips the last one.
+        scroll.automaticallyAdjustsContentInsets = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         fx.addSubview(scroll)
+        let pad = SwitcherPanel.padding
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: fx.topAnchor, constant: 6),
-            scroll.bottomAnchor.constraint(equalTo: fx.bottomAnchor, constant: -6),
-            scroll.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: fx.topAnchor, constant: pad),
+            scroll.bottomAnchor.constraint(equalTo: fx.bottomAnchor, constant: -pad),
+            scroll.leadingAnchor.constraint(equalTo: fx.leadingAnchor, constant: pad),
+            scroll.trailingAnchor.constraint(equalTo: fx.trailingAnchor, constant: -pad),
         ])
         contentView = fx
     }
@@ -254,12 +280,16 @@ final class SwitcherPanel: NSPanel {
         windows = fetchWindows()
         guard !windows.isEmpty else { return }
         table.reloadData()
+
+        // Size the window first, so the row scroll below is computed against the final clip height.
+        let rowsVisible = min(windows.count, SwitcherPanel.maxVisibleRows)
+        let height = CGFloat(rowsVisible) * table.rowHeight + SwitcherPanel.padding * 2
+        setContentSize(NSSize(width: 560, height: height))
+        center()
+
         let row = min(selectIndex, windows.count - 1)
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
-        let rowsVisible = min(windows.count, 14)
-        setContentSize(NSSize(width: 560, height: CGFloat(rowsVisible) * table.rowHeight + 12))
-        center()
         makeKeyAndOrderFront(nil)
     }
 
@@ -309,6 +339,13 @@ extension SwitcherPanel: NSTableViewDelegate {
         cell.identifier = WindowCell.id
         cell.configure(with: windows[row])
         return cell
+    }
+
+    func tableView(_ t: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = t.makeView(withIdentifier: WindowRowView.id, owner: nil) as? WindowRowView
+            ?? WindowRowView()
+        view.identifier = WindowRowView.id
+        return view
     }
 }
 
