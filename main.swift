@@ -1,11 +1,25 @@
 import Cocoa
 import Carbon
 
-// Private SkyLight symbol — always resident because NSApplication loads the framework.
+// Private SkyLight symbols — always resident because NSApplication loads the framework.
+
 // Disables/enables symbolic hotkeys (⌘Tab = 1, ⌘Shift+Tab = 2) system-wide.
 // IMPORTANT: the effect persists after the process exits, so we must restore on quit/signal.
 @_silgen_name("CGSSetSymbolicHotKeyEnabled") @discardableResult
 func CGSSetSymbolicHotKeyEnabled(_ hotKey: Int, _ isEnabled: Bool) -> Int32
+
+// Window-server connection and property reader — no Screen Recording or AX permission needed.
+typealias CGSConnectionID = UInt32
+@_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> CGSConnectionID
+@_silgen_name("CGSCopyWindowProperty") @discardableResult
+func CGSCopyWindowProperty(_ cid: CGSConnectionID, _ wid: CGWindowID,
+                            _ property: CFString, _ value: UnsafeMutablePointer<CFTypeRef?>) -> CGError
+
+// Maps an AXUIElement to its CGWindowID. The "AXWindowID" attribute does NOT exist
+// in the public AX API — this private symbol is the only reliable way to correlate
+// an AX window with a window from CGWindowListCopyWindowInfo.
+@_silgen_name("_AXUIElementGetWindow") @discardableResult
+func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 func setSystemCmdTab(enabled: Bool) {
     CGSSetSymbolicHotKeyEnabled(1, enabled) // ⌘Tab
@@ -15,10 +29,11 @@ func setSystemCmdTab(enabled: Bool) {
 // MARK: - Model
 
 struct WindowInfo {
+    let id: CGWindowID
     let pid: pid_t
     let appName: String
     let title: String
-    var label: String { title.isEmpty ? appName : "\(appName)  —  \(title)" }
+    var label: String { title.isEmpty ? appName : "\(title) — \(appName)" }
 }
 
 // MARK: - Window Discovery
@@ -29,50 +44,63 @@ func fetchWindows() -> [WindowInfo] {
     ) as? [[CFString: Any]] else { return [] }
 
     let myPID = Int(ProcessInfo.processInfo.processIdentifier)
+    let conn = CGSMainConnectionID()
     var seenIDs = Set<CGWindowID>()
-
-    // If accessibility is granted, pre-fetch AX windows per PID so we can read
-    // window titles without needing Screen Recording permission.
-    var axWindowsByPID: [pid_t: [AXUIElement]] = [:]
-    var countByPID:     [pid_t: Int] = [:]
-    if AXIsProcessTrusted() {
-        let pids: Set<pid_t> = Set(list.compactMap { d in
-            guard let layer = d[kCGWindowLayer] as? Int, layer == 0,
-                  let pidInt = d[kCGWindowOwnerPID] as? Int, pidInt != myPID
-            else { return nil }
-            return pid_t(pidInt)
-        })
-        for pid in pids {
-            let axApp = AXUIElementCreateApplication(pid)
-            var ref: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
-               let wins = ref as? [AXUIElement] { axWindowsByPID[pid] = wins }
-        }
-    }
+    // AXUIElementCreateApplication + kAXWindowsAttribute is expensive; cache per pid
+    // so apps with many windows aren't queried repeatedly.
+    var axWindowCache: [pid_t: [AXUIElement]] = [:]
 
     return list.compactMap { d in
         guard
-            let layer  = d[kCGWindowLayer]    as? Int,        layer == 0,
-            let pidInt = d[kCGWindowOwnerPID] as? Int,        pidInt != myPID,
+            let layer  = d[kCGWindowLayer]    as? Int,    layer == 0,
+            let pidInt = d[kCGWindowOwnerPID] as? Int,    pidInt != myPID,
             let winID  = d[kCGWindowNumber]   as? CGWindowID,
             let app    = d[kCGWindowOwnerName] as? String,
-            seenIDs.insert(winID).inserted          // deduplicate by window ID
+            seenIDs.insert(winID).inserted
         else { return nil }
 
         let pid = pid_t(pidInt)
-        let idx = countByPID[pid, default: 0]
-        countByPID[pid] = idx + 1
-
-        // Prefer AX title (no Screen Recording needed); fall back to CGWindowName.
-        var title = d[kCGWindowName] as? String ?? ""
-        if title.isEmpty, let wins = axWindowsByPID[pid], idx < wins.count {
-            var t: CFTypeRef?
-            AXUIElementCopyAttributeValue(wins[idx], kAXTitleAttribute as CFString, &t)
-            title = t as? String ?? ""
-        }
-
-        return WindowInfo(pid: pid, appName: app, title: title)
+        let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
+        return WindowInfo(id: winID, pid: pid, appName: app, title: title)
     }
+}
+
+// Best-effort title: AX first (most reliable), CGS window-server property as fallback.
+private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
+                         cache: inout [pid_t: [AXUIElement]]) -> String {
+    // AX title (requires Accessibility permission).
+    if AXIsProcessTrusted() {
+        let wins: [AXUIElement]
+        if let cached = cache[pid] {
+            wins = cached
+        } else {
+            var winsRef: CFTypeRef?
+            let axApp = AXUIElementCreateApplication(pid)
+            if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
+               let w = winsRef as? [AXUIElement] {
+                wins = w
+            } else {
+                wins = []
+            }
+            cache[pid] = wins
+        }
+        for axWin in wins {
+            var id = CGWindowID(0)
+            guard _AXUIElementGetWindow(axWin, &id) == .success, id == winID else { continue }
+            var tRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &tRef) == .success,
+               let t = tRef as? String, !t.isEmpty {
+                return t
+            }
+            break
+        }
+    }
+
+    // CGS fallback: reads from the window server, no permission needed
+    // (often empty for other apps' windows on recent macOS).
+    var cgsRef: CFTypeRef?
+    CGSCopyWindowProperty(conn, winID, "kCGSWindowTitle" as CFString, &cgsRef)
+    return cgsRef as? String ?? ""
 }
 
 // MARK: - Window Activation
@@ -83,13 +111,12 @@ func raiseWindow(_ w: WindowInfo) {
     if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
        let wins = ref as? [AXUIElement] {
         for axWin in wins {
-            var t: CFTypeRef?
-            AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &t)
-            if (t as? String ?? "") == w.title {
-                AXUIElementSetAttributeValue(axWin, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-                AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
-                break
-            }
+            var id = CGWindowID(0)
+            guard _AXUIElementGetWindow(axWin, &id) == .success, id == w.id else { continue }
+            AXUIElementSetAttributeValue(axWin, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+            AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
+            break
         }
     }
     if let runningApp = NSRunningApplication(processIdentifier: w.pid) {
@@ -214,13 +241,13 @@ final class SwitcherPanel: NSPanel {
     }
 
     func selectNext() {
-        let row = min(windows.count - 1, table.selectedRow + 1)
+        let row = (table.selectedRow + 1) % windows.count
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
     }
 
     func selectPrevious() {
-        let row = max(0, table.selectedRow - 1)
+        let row = (table.selectedRow - 1 + windows.count) % windows.count
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
     }
@@ -396,12 +423,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestAccessibility() {
         guard !AXIsProcessTrusted() else { return }
-        // Ad-hoc signing ties the TCC entry to the binary hash, so each rebuild revokes
-        // the permission. Prompt only on the very first launch; after that the user can
-        // re-grant via "Grant Accessibility Access…" in the menu bar.
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: "hasPromptedAccessibility") else { return }
-        defaults.set(true, forKey: "hasPromptedAccessibility")
         let key = "AXTrustedCheckOptionPrompt" as CFString
         AXIsProcessTrustedWithOptions([key: kCFBooleanTrue] as CFDictionary)
     }

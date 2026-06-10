@@ -1,6 +1,7 @@
-APP    = MiniSwitcher
-BUNDLE = $(APP).app
-BIN    = $(BUNDLE)/Contents/MacOS/$(APP)
+APP       = MiniSwitcher
+BUNDLE    = $(APP).app
+BIN       = $(BUNDLE)/Contents/MacOS/$(APP)
+BUNDLE_ID = com.local.miniswitcher
 
 .PHONY: build run clean
 
@@ -14,7 +15,12 @@ build: AppIcon.icns
 	cp $(APP) $(BIN)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp AppIcon.icns $(BUNDLE)/Contents/Resources/
-	codesign --force --deep --sign - $(BUNDLE)
+	# Override the designated requirement to use the bundle identifier rather than
+	# the binary hash, so TCC persists the accessibility grant across rebuilds.
+	codesign --force --deep --sign - \
+		--identifier "$(BUNDLE_ID)" \
+		--requirements '=designated => identifier "$(BUNDLE_ID)"' \
+		$(BUNDLE)
 
 run: build
 	open $(BUNDLE)
