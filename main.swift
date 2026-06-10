@@ -209,6 +209,7 @@ final class SwitcherPanel: NSPanel {
         table.dataSource = self
         table.delegate = self
         table.target = self
+        table.action = #selector(handleClick)
         table.doubleAction = #selector(commitAndClose)
 
         let scroll = NSScrollView()
@@ -256,6 +257,15 @@ final class SwitcherPanel: NSPanel {
         let row = table.selectedRow
         orderOut(nil)
         guard row >= 0, row < windows.count else { return }
+        raiseWindow(windows[row])
+    }
+
+    // Single click commits the clicked row immediately — even while ⌘ is still held,
+    // this beats the Cmd-release handler (the panel is gone by the time Cmd lifts).
+    @objc func handleClick() {
+        let row = table.clickedRow
+        guard row >= 0, row < windows.count else { return }
+        orderOut(nil)
         raiseWindow(windows[row])
     }
 
