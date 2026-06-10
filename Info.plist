@@ -20,5 +20,7 @@
     <true/>
     <key>NSAccessibilityUsageDescription</key>
     <string>MiniSwitcher needs Accessibility access to raise specific windows.</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>

@@ -4,18 +4,20 @@ BIN    = $(BUNDLE)/Contents/MacOS/$(APP)
 
 .PHONY: build run clean
 
-build:
+# Generate once; only reruns if generate_icon.swift is newer than the .icns.
+AppIcon.icns: generate_icon.swift
+	swiftc generate_icon.swift -o .gen_icon && ./.gen_icon; rm -f .gen_icon
+
+build: AppIcon.icns
 	swiftc main.swift -o $(APP)
-	mkdir -p $(BUNDLE)/Contents/MacOS
+	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources
 	cp $(APP) $(BIN)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
-	# Ad-hoc sign so macOS TCC tracks permissions by bundle ID rather than raw binary hash.
-	# After the very first build+permission grant you should only need to re-grant if you
-	# explicitly clean and rebuild (binary content changes → signature changes).
+	cp AppIcon.icns $(BUNDLE)/Contents/Resources/
 	codesign --force --deep --sign - $(BUNDLE)
 
 run: build
 	open $(BUNDLE)
 
 clean:
-	rm -rf $(APP) $(BUNDLE)
+	rm -rf $(APP) $(BUNDLE) AppIcon.icns

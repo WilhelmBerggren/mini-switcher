@@ -105,23 +105,38 @@ func raiseWindow(_ w: WindowInfo) {
 
 final class WindowCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("WindowCell")
+    private let iconView = NSImageView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+
         let tf = NSTextField(labelWithString: "")
         tf.font = .systemFont(ofSize: 14)
         tf.lineBreakMode = .byTruncatingTail
         tf.translatesAutoresizingMaskIntoConstraints = false
         addSubview(tf)
         textField = tf
+
         NSLayoutConstraint.activate([
-            tf.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
+            tf.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
             tf.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             tf.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func configure(with window: WindowInfo) {
+        textField?.stringValue = window.label
+        iconView.image = NSRunningApplication(processIdentifier: window.pid)?.icon
+    }
 }
 
 // MARK: - Switcher Panel
@@ -239,7 +254,7 @@ extension SwitcherPanel: NSTableViewDelegate {
         let cell = t.makeView(withIdentifier: WindowCell.id, owner: nil) as? WindowCell
             ?? WindowCell(frame: .zero)
         cell.identifier = WindowCell.id
-        cell.textField?.stringValue = windows[row].label
+        cell.configure(with: windows[row])
         return cell
     }
 }
@@ -247,39 +262,15 @@ extension SwitcherPanel: NSTableViewDelegate {
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Statics accessed by @convention(c) callbacks
+    // Statics accessed by @convention(c) callbacks and the flags monitor closure
     static var shared: AppDelegate!
-    static var cmdIsDown = false
-    static var eventTap: CFMachPort?
+    static var cmdIsDown   = false
+    static var shiftWasDown = false
     static var hotKeyRef: EventHotKeyRef?
-    static var hotKeyRefBack: EventHotKeyRef?
     static var hotKeyHandlerRef: EventHandlerRef?
 
     private let panel = SwitcherPanel()
     private var statusItem: NSStatusItem!
-    private var runLoopSource: CFRunLoopSource?
-
-    // CGEvent tap callback: handles only flagsChanged (Cmd release → close panel)
-    // and re-enables the tap if macOS disables it. @convention(c) compatible: no captures.
-    private static let tapCallback: CGEventTapCallBack = { _, type, cgEvent, _ in
-        switch type {
-        case .flagsChanged:
-            let cmdNow = cgEvent.flags.contains(.maskCommand)
-            DispatchQueue.main.async {
-                let wasDown = AppDelegate.cmdIsDown
-                AppDelegate.cmdIsDown = cmdNow
-                if wasDown && !cmdNow && AppDelegate.shared.panel.isVisible {
-                    AppDelegate.shared.panel.commitAndClose()
-                }
-            }
-            return Unmanaged.passUnretained(cgEvent)
-        case .tapDisabledByUserInput, .tapDisabledByTimeout:
-            if let tap = AppDelegate.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return Unmanaged.passUnretained(cgEvent)
-        default:
-            return Unmanaged.passUnretained(cgEvent)
-        }
-    }
 
     func applicationDidFinishLaunching(_: Notification) {
         AppDelegate.shared = self
@@ -290,7 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Must be restored on exit — the effect persists across process restarts.
         setSystemCmdTab(enabled: false)
         setupHotKeys()
-        setupEventTap()
+        setupFlagsMonitor()
         installSignalHandlers()
     }
 
@@ -298,16 +289,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setSystemCmdTab(enabled: true)
     }
 
-    // Called from the Carbon hotkey handler on the main thread.
-    // id 1 = ⌘Tab (forward), id 2 = ⌘Shift+Tab (backward).
-    func handleHotKey(id: UInt32) {
-        AppDelegate.cmdIsDown = true  // Cmd is held whenever this hotkey fires
+    // Called from the Carbon hotkey handler on the main thread (⌘Tab only).
+    func handleHotKey() {
+        AppDelegate.cmdIsDown = true
         if panel.isVisible {
-            id == 1 ? panel.selectNext() : panel.selectPrevious()
+            panel.selectNext()
         } else {
-            // Start at index 1 so the first press selects the previously used window,
-            // matching macOS ⌘Tab convention. Backward starts at the end of the list.
-            panel.present(selectIndex: id == 2 ? Int.max : 1)
+            panel.present(selectIndex: 1)
         }
     }
 
@@ -326,41 +314,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 EventParamName(kEventParamDirectObject),
                 EventParamType(typeEventHotKeyID),
                 nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
-            let hotKeyID = id.id
-            DispatchQueue.main.async { AppDelegate.shared.handleHotKey(id: hotKeyID) }
+            DispatchQueue.main.async { AppDelegate.shared.handleHotKey() }
             return noErr
         }, 1, &spec, nil, &AppDelegate.hotKeyHandlerRef)
 
         let sig: OSType = 0x4D534E57
-        // ⌘Tab (forward, id 1)
         let fwdID = EventHotKeyID(signature: sig, id: 1)
         RegisterEventHotKey(UInt32(kVK_Tab), UInt32(cmdKey),
                             fwdID, target, 0, &AppDelegate.hotKeyRef)
-        // ⌘Shift+Tab (backward, id 2)
-        let bwdID = EventHotKeyID(signature: sig, id: 2)
-        RegisterEventHotKey(UInt32(kVK_Tab), UInt32(cmdKey | shiftKey),
-                            bwdID, target, 0, &AppDelegate.hotKeyRefBack)
     }
 
-    private func setupEventTap() {
-        // Tap only needs flagsChanged to detect when Cmd is released while panel is showing.
-        // Requires Accessibility permission; if unavailable, panel must be closed manually.
-        let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
-        guard let tap = CGEvent.tapCreate(
-            tap: .cghidEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: mask,
-            callback: AppDelegate.tapCallback,
-            userInfo: nil
-        ) else {
-            print("CGEvent tap failed — grant Accessibility in System Settings, then restart")
-            return
+    private func setupFlagsMonitor() {
+        // Global monitor fires for events routed to OTHER apps (panel is not key).
+        // Local monitor fires when OUR panel is the key window.
+        // Both are needed because makeKeyAndOrderFront routes flagsChanged to us locally.
+        let handle: (NSEvent) -> Void = { event in
+            let flags     = event.modifierFlags
+            let cmdNow    = flags.contains(.command)
+            let shiftNow  = flags.contains(.shift)
+            let panelUp   = AppDelegate.shared.panel.isVisible
+
+            // Shift pressed while Cmd is held → navigate backwards
+            if AppDelegate.cmdIsDown && cmdNow && shiftNow && !AppDelegate.shiftWasDown && panelUp {
+                AppDelegate.shared.panel.selectPrevious()
+            }
+
+            let wasDown = AppDelegate.cmdIsDown
+            AppDelegate.cmdIsDown   = cmdNow
+            AppDelegate.shiftWasDown = shiftNow
+
+            // Cmd released → commit selection
+            if wasDown && !cmdNow && panelUp {
+                AppDelegate.shared.panel.commitAndClose()
+            }
         }
-        AppDelegate.eventTap = tap
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: handle)
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+            handle(event); return event
+        }
     }
 
     private func setupMenuBar() {
@@ -373,6 +364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(
             title: "Show Window Switcher", action: #selector(showPanel), keyEquivalent: ""
         ))
+        menu.addItem(NSMenuItem(
+            title: "Grant Accessibility Access…", action: #selector(openAccessibilityPrefs), keyEquivalent: ""
+        ))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Quit MiniSwitcher",
@@ -383,6 +377,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showPanel() { panel.present() }
+
+    @objc private func openAccessibilityPrefs() {
+        NSWorkspace.shared.open(
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        )
+    }
 
     private func installSignalHandlers() {
         // Restore system ⌘Tab if the process is killed, so it doesn't stay disabled permanently.
@@ -396,6 +396,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestAccessibility() {
         guard !AXIsProcessTrusted() else { return }
+        // Ad-hoc signing ties the TCC entry to the binary hash, so each rebuild revokes
+        // the permission. Prompt only on the very first launch; after that the user can
+        // re-grant via "Grant Accessibility Access…" in the menu bar.
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "hasPromptedAccessibility") else { return }
+        defaults.set(true, forKey: "hasPromptedAccessibility")
         let key = "AXTrustedCheckOptionPrompt" as CFString
         AXIsProcessTrustedWithOptions([key: kCFBooleanTrue] as CFDictionary)
     }
