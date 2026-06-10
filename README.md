@@ -1,18 +1,18 @@
 <h1 align="center">
-  <img src="icon.png" width="120" alt="MiniSwitcher icon"><br>
-  MiniSwitcher
+  <img src="icon.png" width="120" alt="Fonsterbyte icon"><br>
+  Fonsterbyte
 </h1>
 
 <p align="center">A tiny macOS window switcher — a mini version of <a href="https://github.com/lwouis/alt-tab-macos">AltTab</a>.</p>
 
 <p align="center">
-  <img src="preview.png" width="560" alt="MiniSwitcher showing a list of open windows">
+  <img src="preview.png" width="560" alt="Fonsterbyte showing a list of open windows">
 </p>
 
 
 macOS's built-in `⌘Tab` switches between *applications*. AltTab famously replaces
 it with a switcher over individual *windows*, the way Windows and most Linux DEs
-work. MiniSwitcher is a deliberately small take on that idea: a single Swift file,
+work. Fonsterbyte is a deliberately small take on that idea: a single Swift file,
 no dependencies, no build system beyond `swiftc` and `make`. It exists to show how
 little code the core of a window switcher actually takes — list every on-screen
 window with its title and icon, and raise the one you pick.
@@ -41,13 +41,13 @@ window with its title and icon, and raise the one you pick.
 ## Build & run
 
 ```sh
-make build   # compile main.swift and assemble MiniSwitcher.app
+make build   # compile main.swift and assemble Fonsterbyte.app
 make run     # build, then launch the app
 make clean   # remove build artifacts
 ```
 
 `make build` compiles `main.swift`, generates the app icon from an SF Symbol
-(once, via `generate_icon.swift`), assembles `MiniSwitcher.app`, and ad-hoc
+(once, via `generate_icon.swift`), assembles `Fonsterbyte.app`, and ad-hoc
 code-signs it. The signing step pins the bundle's *designated requirement* to the
 bundle identifier rather than the binary hash, so the Accessibility grant survives
 rebuilds — you don't have to re-approve the app every time you recompile.
@@ -57,7 +57,7 @@ After the first `make run`, grant Accessibility access when prompted, then trigg
 
 ## Releasing
 
-Builds are published to [GitHub Releases](https://github.com/WilhelmBerggren/mini-switcher/releases)
+Builds are published to [GitHub Releases](https://github.com/WilhelmBerggren/fonsterbyte/releases)
 with the `gh` CLI. To cut a new release (e.g. `v0.1.2`):
 
 1. **Commit and push** everything you want in the release; make sure `main` is
@@ -67,24 +67,24 @@ with the `gh` CLI. To cut a new release (e.g. `v0.1.2`):
    structure and ad-hoc signature are preserved:
    ```sh
    make build
-   ditto -c -k --sequesterRsrc --keepParent MiniSwitcher.app MiniSwitcher.zip
+   ditto -c -k --sequesterRsrc --keepParent Fonsterbyte.app Fonsterbyte.zip
    ```
 3. **Create the release**, attaching the zip:
    ```sh
-   gh release create v0.1.2 MiniSwitcher.zip \
+   gh release create v0.1.2 Fonsterbyte.zip \
      --target main \
-     --title "MiniSwitcher v0.1.2" \
+     --title "Fonsterbyte v0.1.2" \
      --notes "What changed in this release…"
    ```
 4. **Verify** the asset uploaded: `gh release view v0.1.2`.
 
 Notes:
 
-- `MiniSwitcher.zip` is a build artifact and is git-ignored — it lives only as a
+- `Fonsterbyte.zip` is a build artifact and is git-ignored — it lives only as a
   release asset, never in the repo.
 - The app is **ad-hoc signed and not notarized**, so Gatekeeper blocks it on
   other machines. Release notes should tell users to right-click → Open (or run
-  `xattr -dr com.apple.quarantine MiniSwitcher.app`). A frictionless download
+  `xattr -dr com.apple.quarantine Fonsterbyte.app`). A frictionless download
   would require a Developer ID signature plus notarization.
 
 ## How it works
@@ -95,7 +95,7 @@ The interesting bits live in `main.swift`:
   windows).
 - **Window titles** come from the Accessibility API. The tricky part is matching an
   `AXUIElement` back to a `CGWindowID`; the public AX API has no attribute for this,
-  so MiniSwitcher uses the private `_AXUIElementGetWindow` symbol — the same approach
+  so Fonsterbyte uses the private `_AXUIElementGetWindow` symbol — the same approach
   AltTab uses. A `CGSCopyWindowProperty` window-server read is kept as a fallback.
 - **Taking over `⌘Tab`** is done by disabling the system symbolic hotkey
   (`CGSSetSymbolicHotKeyEnabled`) and registering our own Carbon hotkey. This change

@@ -1,7 +1,7 @@
-APP       = MiniSwitcher
+APP       = Fonsterbyte
 BUNDLE    = $(APP).app
 BIN       = $(BUNDLE)/Contents/MacOS/$(APP)
-BUNDLE_ID = com.local.miniswitcher
+BUNDLE_ID = com.local.fonsterbyte
 
 .PHONY: build run clean
 

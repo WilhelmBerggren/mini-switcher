@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>MiniSwitcher</string>
+    <string>Fonsterbyte</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.miniswitcher</string>
+    <string>com.local.fonsterbyte</string>
     <key>CFBundleName</key>
-    <string>MiniSwitcher</string>
+    <string>Fonsterbyte</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundlePackageType</key>
@@ -19,7 +19,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAccessibilityUsageDescription</key>
-    <string>MiniSwitcher needs Accessibility access to raise specific windows.</string>
+    <string>Fonsterbyte needs Accessibility access to raise specific windows.</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
 </dict>
