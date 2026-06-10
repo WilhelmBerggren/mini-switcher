@@ -166,10 +166,32 @@ final class WindowCell: NSTableCellView {
     }
 }
 
+// MARK: - Hover-Tracking Table
+
+// Selects the row under the cursor as the mouse moves, so hover-then-commit
+// (click, Return, or ⌘ release) acts on the window you're pointing at.
+final class HoverTableView: NSTableView {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        guard row >= 0, row != selectedRow else { return }
+        selectRowIndexes([row], byExtendingSelection: false)
+    }
+}
+
 // MARK: - Switcher Panel
 
 final class SwitcherPanel: NSPanel {
-    private let table = NSTableView()
+    private let table = HoverTableView()
     private var windows: [WindowInfo] = []
 
     convenience init() {
