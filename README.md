@@ -55,6 +55,38 @@ rebuilds — you don't have to re-approve the app every time you recompile.
 After the first `make run`, grant Accessibility access when prompted, then trigger
 `⌘Tab`.
 
+## Releasing
+
+Builds are published to [GitHub Releases](https://github.com/WilhelmBerggren/mini-switcher/releases)
+with the `gh` CLI. To cut a new release (e.g. `v0.1.2`):
+
+1. **Commit and push** everything you want in the release; make sure `main` is
+   in sync with `origin` (`git push`). The release tag points at the current
+   `main` commit.
+2. **Build a fresh bundle and zip it.** Use `ditto` (not `zip`) so the `.app`
+   structure and ad-hoc signature are preserved:
+   ```sh
+   make build
+   ditto -c -k --sequesterRsrc --keepParent MiniSwitcher.app MiniSwitcher.zip
+   ```
+3. **Create the release**, attaching the zip:
+   ```sh
+   gh release create v0.1.2 MiniSwitcher.zip \
+     --target main \
+     --title "MiniSwitcher v0.1.2" \
+     --notes "What changed in this release…"
+   ```
+4. **Verify** the asset uploaded: `gh release view v0.1.2`.
+
+Notes:
+
+- `MiniSwitcher.zip` is a build artifact and is git-ignored — it lives only as a
+  release asset, never in the repo.
+- The app is **ad-hoc signed and not notarized**, so Gatekeeper blocks it on
+  other machines. Release notes should tell users to right-click → Open (or run
+  `xattr -dr com.apple.quarantine MiniSwitcher.app`). A frictionless download
+  would require a Developer ID signature plus notarization.
+
 ## How it works
 
 The interesting bits live in `main.swift`:
