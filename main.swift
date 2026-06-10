@@ -209,8 +209,8 @@ final class SwitcherPanel: NSPanel {
         table.dataSource = self
         table.delegate = self
         table.target = self
+        // Single click commits immediately, so there is no double-click path to handle.
         table.action = #selector(handleClick)
-        table.doubleAction = #selector(commitAndClose)
 
         let scroll = NSScrollView()
         scroll.documentView = table
@@ -241,31 +241,25 @@ final class SwitcherPanel: NSPanel {
         makeKeyAndOrderFront(nil)
     }
 
-    func selectNext() {
-        let row = (table.selectedRow + 1) % windows.count
+    func selectNext()     { select(by: 1) }
+    func selectPrevious() { select(by: -1) }
+
+    private func select(by delta: Int) {
+        guard !windows.isEmpty else { return }
+        let row = (table.selectedRow + delta + windows.count) % windows.count
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
     }
 
-    func selectPrevious() {
-        let row = (table.selectedRow - 1 + windows.count) % windows.count
-        table.selectRowIndexes([row], byExtendingSelection: false)
-        table.scrollRowToVisible(row)
-    }
-
-    @objc func commitAndClose() {
-        let row = table.selectedRow
-        orderOut(nil)
-        guard row >= 0, row < windows.count else { return }
-        raiseWindow(windows[row])
-    }
+    @objc func commitAndClose() { commit(row: table.selectedRow) }
 
     // Single click commits the clicked row immediately — even while ⌘ is still held,
     // this beats the Cmd-release handler (the panel is gone by the time Cmd lifts).
-    @objc func handleClick() {
-        let row = table.clickedRow
-        guard row >= 0, row < windows.count else { return }
+    @objc func handleClick() { commit(row: table.clickedRow) }
+
+    private func commit(row: Int) {
         orderOut(nil)
+        guard row >= 0, row < windows.count else { return }
         raiseWindow(windows[row])
     }
 
