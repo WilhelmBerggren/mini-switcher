@@ -1,6 +1,14 @@
-# MiniSwitcher
+<h1 align="center">
+  <img src="icon.png" width="120" alt="MiniSwitcher icon"><br>
+  MiniSwitcher
+</h1>
 
-A tiny macOS window switcher — a mini version of [AltTab](https://github.com/lwouis/alt-tab-macos).
+<p align="center">A tiny macOS window switcher — a mini version of <a href="https://github.com/lwouis/alt-tab-macos">AltTab</a>.</p>
+
+<p align="center">
+  <img src="preview.png" width="560" alt="MiniSwitcher showing a list of open windows">
+</p>
+
 
 macOS's built-in `⌘Tab` switches between *applications*. AltTab famously replaces
 it with a switcher over individual *windows*, the way Windows and most Linux DEs
