@@ -29,18 +29,49 @@ func fetchWindows() -> [WindowInfo] {
     ) as? [[CFString: Any]] else { return [] }
 
     let myPID = Int(ProcessInfo.processInfo.processIdentifier)
-    var seen = Set<String>()
+    var seenIDs = Set<CGWindowID>()
+
+    // If accessibility is granted, pre-fetch AX windows per PID so we can read
+    // window titles without needing Screen Recording permission.
+    var axWindowsByPID: [pid_t: [AXUIElement]] = [:]
+    var countByPID:     [pid_t: Int] = [:]
+    if AXIsProcessTrusted() {
+        let pids: Set<pid_t> = Set(list.compactMap { d in
+            guard let layer = d[kCGWindowLayer] as? Int, layer == 0,
+                  let pidInt = d[kCGWindowOwnerPID] as? Int, pidInt != myPID
+            else { return nil }
+            return pid_t(pidInt)
+        })
+        for pid in pids {
+            let axApp = AXUIElementCreateApplication(pid)
+            var ref: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
+               let wins = ref as? [AXUIElement] { axWindowsByPID[pid] = wins }
+        }
+    }
 
     return list.compactMap { d in
         guard
-            let layer = d[kCGWindowLayer] as? Int, layer == 0,
-            let pidInt = d[kCGWindowOwnerPID] as? Int, pidInt != myPID,
-            let app = d[kCGWindowOwnerName] as? String
+            let layer  = d[kCGWindowLayer]    as? Int,        layer == 0,
+            let pidInt = d[kCGWindowOwnerPID] as? Int,        pidInt != myPID,
+            let winID  = d[kCGWindowNumber]   as? CGWindowID,
+            let app    = d[kCGWindowOwnerName] as? String,
+            seenIDs.insert(winID).inserted          // deduplicate by window ID
         else { return nil }
 
-        let title = d[kCGWindowName] as? String ?? ""
-        guard seen.insert("\(pidInt):\(title)").inserted else { return nil }
-        return WindowInfo(pid: pid_t(pidInt), appName: app, title: title)
+        let pid = pid_t(pidInt)
+        let idx = countByPID[pid, default: 0]
+        countByPID[pid] = idx + 1
+
+        // Prefer AX title (no Screen Recording needed); fall back to CGWindowName.
+        var title = d[kCGWindowName] as? String ?? ""
+        if title.isEmpty, let wins = axWindowsByPID[pid], idx < wins.count {
+            var t: CFTypeRef?
+            AXUIElementCopyAttributeValue(wins[idx], kAXTitleAttribute as CFString, &t)
+            title = t as? String ?? ""
+        }
+
+        return WindowInfo(pid: pid, appName: app, title: title)
     }
 }
 
@@ -55,6 +86,7 @@ func raiseWindow(_ w: WindowInfo) {
             var t: CFTypeRef?
             AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &t)
             if (t as? String ?? "") == w.title {
+                AXUIElementSetAttributeValue(axWin, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
                 AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
                 break
             }
@@ -269,6 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Called from the Carbon hotkey handler on the main thread.
     // id 1 = ⌘Tab (forward), id 2 = ⌘Shift+Tab (backward).
     func handleHotKey(id: UInt32) {
+        AppDelegate.cmdIsDown = true  // Cmd is held whenever this hotkey fires
         if panel.isVisible {
             id == 1 ? panel.selectNext() : panel.selectPrevious()
         } else {
@@ -362,6 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestAccessibility() {
+        guard !AXIsProcessTrusted() else { return }
         let key = "AXTrustedCheckOptionPrompt" as CFString
         AXIsProcessTrustedWithOptions([key: kCFBooleanTrue] as CFDictionary)
     }

@@ -9,6 +9,10 @@ build:
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	cp $(APP) $(BIN)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
+	# Ad-hoc sign so macOS TCC tracks permissions by bundle ID rather than raw binary hash.
+	# After the very first build+permission grant you should only need to re-grant if you
+	# explicitly clean and rebuild (binary content changes → signature changes).
+	codesign --force --deep --sign - $(BUNDLE)
 
 run: build
 	open $(BUNDLE)
