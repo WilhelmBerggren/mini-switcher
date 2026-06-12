@@ -33,36 +33,73 @@ struct WindowInfo {
     let pid: pid_t
     let appName: String
     let title: String
+    let isMinimized: Bool
     var label: String { title.isEmpty ? appName : "\(title) — \(appName)" }
 }
 
 // MARK: - Window Discovery
 
 func fetchWindows() -> [WindowInfo] {
-    guard let list = CGWindowListCopyWindowInfo(
-        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-    ) as? [[CFString: Any]] else { return [] }
-
-    let myPID = Int(ProcessInfo.processInfo.processIdentifier)
+    let myPID = ProcessInfo.processInfo.processIdentifier
     let conn = CGSMainConnectionID()
     var seenIDs = Set<CGWindowID>()
     // AXUIElementCreateApplication + kAXWindowsAttribute is expensive; cache per pid
     // so apps with many windows aren't queried repeatedly.
     var axWindowCache: [pid_t: [AXUIElement]] = [:]
+    var result: [WindowInfo] = []
 
-    return list.compactMap { d in
-        guard
-            let layer  = d[kCGWindowLayer]    as? Int,    layer == 0,
-            let pidInt = d[kCGWindowOwnerPID] as? Int,    pidInt != myPID,
-            let winID  = d[kCGWindowNumber]   as? CGWindowID,
-            let app    = d[kCGWindowOwnerName] as? String,
-            seenIDs.insert(winID).inserted
-        else { return nil }
+    // 1. On-screen windows, in front-to-back z-order. Minimized windows are excluded
+    //    from this list (they aren't on screen), so they're handled in pass 2.
+    if let list = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[CFString: Any]] {
+        for d in list {
+            guard
+                let layer  = d[kCGWindowLayer]    as? Int,    layer == 0,
+                let pidInt = d[kCGWindowOwnerPID] as? Int,    pid_t(pidInt) != myPID,
+                let winID  = d[kCGWindowNumber]   as? CGWindowID,
+                let app    = d[kCGWindowOwnerName] as? String,
+                seenIDs.insert(winID).inserted
+            else { continue }
 
-        let pid = pid_t(pidInt)
-        let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
-        return WindowInfo(id: winID, pid: pid, appName: app, title: title)
+            let pid = pid_t(pidInt)
+            let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
+            result.append(WindowInfo(id: winID, pid: pid, appName: app, title: title, isMinimized: false))
+        }
     }
+
+    // 2. Minimized windows, found via the AX API (which still sees them), appended after.
+    if AXIsProcessTrusted() {
+        for app in NSWorkspace.shared.runningApplications
+        where app.activationPolicy == .regular && app.processIdentifier != myPID {
+            let pid = app.processIdentifier
+            for axWin in axWindows(pid: pid, cache: &axWindowCache) {
+                var minRef: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(axWin, kAXMinimizedAttribute as CFString, &minRef) == .success,
+                      (minRef as? Bool) == true else { continue }
+                var winID = CGWindowID(0)
+                guard _AXUIElementGetWindow(axWin, &winID) == .success, seenIDs.insert(winID).inserted else { continue }
+
+                let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
+                result.append(WindowInfo(id: winID, pid: pid, appName: app.localizedName ?? "",
+                                         title: title, isMinimized: true))
+            }
+        }
+    }
+
+    return result
+}
+
+// Per-app AX window list, cached (the lookup is expensive and reused across passes).
+private func axWindows(pid: pid_t, cache: inout [pid_t: [AXUIElement]]) -> [AXUIElement] {
+    if let cached = cache[pid] { return cached }
+    var winsRef: CFTypeRef?
+    let axApp = AXUIElementCreateApplication(pid)
+    let wins = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success
+        ? (winsRef as? [AXUIElement] ?? [])
+        : []
+    cache[pid] = wins
+    return wins
 }
 
 // Best-effort title: AX first (most reliable), CGS window-server property as fallback.
@@ -70,21 +107,7 @@ private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
                          cache: inout [pid_t: [AXUIElement]]) -> String {
     // AX title (requires Accessibility permission).
     if AXIsProcessTrusted() {
-        let wins: [AXUIElement]
-        if let cached = cache[pid] {
-            wins = cached
-        } else {
-            var winsRef: CFTypeRef?
-            let axApp = AXUIElementCreateApplication(pid)
-            if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
-               let w = winsRef as? [AXUIElement] {
-                wins = w
-            } else {
-                wins = []
-            }
-            cache[pid] = wins
-        }
-        for axWin in wins {
+        for axWin in axWindows(pid: pid, cache: &cache) {
             var id = CGWindowID(0)
             guard _AXUIElementGetWindow(axWin, &id) == .success, id == winID else { continue }
             var tRef: CFTypeRef?
@@ -163,6 +186,8 @@ final class WindowCell: NSTableCellView {
     func configure(with window: WindowInfo) {
         textField?.stringValue = window.label
         iconView.image = NSRunningApplication(processIdentifier: window.pid)?.icon
+        // Dim minimized windows so they read as inactive (selecting one un-minimizes it).
+        iconView.alphaValue = window.isMinimized ? 0.4 : 1.0
     }
 }
 
