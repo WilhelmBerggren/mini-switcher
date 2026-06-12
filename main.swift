@@ -210,23 +210,30 @@ final class WindowRowView: NSTableRowView {
 
 // MARK: - Hover-Tracking Table
 
-// Selects the row under the cursor as the mouse moves, so hover-then-commit
-// (click, Return, or ⌘ release) acts on the window you're pointing at.
+// Reports the row under the cursor as the mouse moves (so hover-then-commit acts on the
+// window you're pointing at), and reports when the cursor leaves the list. The panel
+// decides what to do — hover is a preview that reverts on exit.
 final class HoverTableView: NSTableView {
+    var onHover: ((Int) -> Void)?   // row under the cursor (always ≥ 0)
+    var onHoverExit: (() -> Void)?  // cursor left the list area
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: self
         ))
     }
 
     override func mouseMoved(with event: NSEvent) {
         let row = row(at: convert(event.locationInWindow, from: nil))
-        guard row >= 0, row != selectedRow else { return }
-        selectRowIndexes([row], byExtendingSelection: false)
+        if row >= 0 { onHover?(row) }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverExit?()
     }
 }
 
@@ -238,6 +245,9 @@ final class SwitcherPanel: NSPanel {
 
     private let table = HoverTableView()
     private var windows: [WindowInfo] = []
+    // The keyboard/⌘-driven selection. Hover changes the visible selection as a preview
+    // only; if the cursor leaves the list without committing, we revert to this row.
+    private var baseSelectedRow = 0
 
     convenience init() {
         self.init(
@@ -281,6 +291,8 @@ final class SwitcherPanel: NSPanel {
         table.target = self
         // Single click commits immediately, so there is no double-click path to handle.
         table.action = #selector(handleClick)
+        table.onHover = { [weak self] row in self?.hoverSelect(row) }
+        table.onHoverExit = { [weak self] in self?.revertHoverSelection() }
 
         let scroll = NSScrollView()
         scroll.documentView = table
@@ -313,6 +325,7 @@ final class SwitcherPanel: NSPanel {
         center()
 
         let row = min(selectIndex, windows.count - 1)
+        baseSelectedRow = row
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
         makeKeyAndOrderFront(nil)
@@ -324,8 +337,23 @@ final class SwitcherPanel: NSPanel {
     private func select(by delta: Int) {
         guard !windows.isEmpty else { return }
         let row = (table.selectedRow + delta + windows.count) % windows.count
+        baseSelectedRow = row
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
+    }
+
+    // Hover previews a row without disturbing the row we revert to on exit.
+    private func hoverSelect(_ row: Int) {
+        guard row < windows.count, row != table.selectedRow else { return }
+        table.selectRowIndexes([row], byExtendingSelection: false)
+    }
+
+    // Cursor left the list: undo the hover preview, back to the keyboard selection.
+    private func revertHoverSelection() {
+        guard baseSelectedRow >= 0, baseSelectedRow < windows.count,
+              baseSelectedRow != table.selectedRow else { return }
+        table.selectRowIndexes([baseSelectedRow], byExtendingSelection: false)
+        table.scrollRowToVisible(baseSelectedRow)
     }
 
     @objc func commitAndClose() { commit(row: table.selectedRow) }
