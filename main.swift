@@ -68,21 +68,28 @@ func fetchWindows() -> [WindowInfo] {
         }
     }
 
-    // 2. Minimized windows, found via the AX API (which still sees them), appended after.
+    // 2. Everything pass 1 cannot see, appended after it: minimized windows, and windows
+    //    on other Spaces — .optionOnScreenOnly is current-Space only, so a full-screen app
+    //    or another desktop's windows never appear there. AX reports every window an app
+    //    owns regardless of Space or minimized state.
     if AXIsProcessTrusted() {
         for app in NSWorkspace.shared.runningApplications
         where app.activationPolicy == .regular && app.processIdentifier != myPID {
             let pid = app.processIdentifier
             for axWin in axWindows(pid: pid, cache: &axWindowCache) {
-                var minRef: CFTypeRef?
-                guard AXUIElementCopyAttributeValue(axWin, kAXMinimizedAttribute as CFString, &minRef) == .success,
-                      (minRef as? Bool) == true else { continue }
                 var winID = CGWindowID(0)
-                guard _AXUIElementGetWindow(axWin, &winID) == .success, seenIDs.insert(winID).inserted else { continue }
+                guard _AXUIElementGetWindow(axWin, &winID) == .success,
+                      isStandardWindow(axWin),
+                      seenIDs.insert(winID).inserted else { continue }
+
+                var minRef: CFTypeRef?
+                let minimized = AXUIElementCopyAttributeValue(
+                    axWin, kAXMinimizedAttribute as CFString, &minRef) == .success
+                    && (minRef as? Bool) == true
 
                 let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
                 result.append(WindowInfo(id: winID, pid: pid, appName: app.localizedName ?? "",
-                                         title: title, isMinimized: true))
+                                         title: title, isMinimized: minimized))
             }
         }
     }
@@ -100,6 +107,15 @@ private func axWindows(pid: pid_t, cache: inout [pid_t: [AXUIElement]]) -> [AXUI
         : []
     cache[pid] = wins
     return wins
+}
+
+// Keeps sheets, popovers and tool palettes out of the list. Apps that report no subrole at
+// all are let through — dropping them would lose windows the minimized pass used to show.
+private func isStandardWindow(_ axWin: AXUIElement) -> Bool {
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axWin, kAXSubroleAttribute as CFString, &ref) == .success,
+          let subrole = ref as? String else { return true }
+    return subrole == (kAXStandardWindowSubrole as String)
 }
 
 // Best-effort title: AX first (most reliable), CGS window-server property as fallback.
@@ -322,13 +338,23 @@ final class SwitcherPanel: NSPanel {
         let rowsVisible = min(windows.count, SwitcherPanel.maxVisibleRows)
         let height = CGFloat(rowsVisible) * table.rowHeight + SwitcherPanel.padding * 2
         setContentSize(NSSize(width: 560, height: height))
-        center()
+        centerOnCursorScreen()
 
         let row = min(selectIndex, windows.count - 1)
         baseSelectedRow = row
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
         makeKeyAndOrderFront(nil)
+    }
+
+    // Appear where the user is looking: the screen holding the cursor. NSWindow.center()
+    // would instead use NSScreen.main — the screen with the active window.
+    private func centerOnCursorScreen() {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return center() }
+        setFrameOrigin(NSPoint(x: visible.midX - frame.width / 2,
+                               y: visible.midY - frame.height / 2))
     }
 
     func selectNext()     { select(by: 1) }
@@ -414,6 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let panel = SwitcherPanel()
     private var statusItem: NSStatusItem!
+    private var repeatTimer: Timer?
 
     func applicationDidFinishLaunching(_: Notification) {
         AppDelegate.shared = self
@@ -440,6 +467,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             panel.present(selectIndex: 1)
         }
+        scheduleAutoRepeat()
+    }
+
+    // Neither trigger repeats on its own: a Carbon hotkey fires once per physical press, and
+    // ⇧ only reports a flags-changed transition. So holding either would step a single row.
+    // Drive the repeat ourselves instead — wait out the system's key-repeat delay, then tick
+    // at its repeat interval for as long as the key is still held.
+    private func scheduleAutoRepeat() {
+        repeatTimer?.invalidate()
+        schedule(after: NSEvent.keyRepeatDelay, repeats: false) { [weak self] in
+            self?.schedule(after: NSEvent.keyRepeatInterval, repeats: true) { [weak self] in
+                self?.autoRepeatTick()
+            }
+        }
+    }
+
+    private func autoRepeatTick() {
+        // ⇧ via modifierFlags so either shift key counts; Tab via live key state (a held key
+        // sends no events of its own). ⇧ wins when both are down — it's the backwards gesture.
+        let shiftDown = NSEvent.modifierFlags.contains(.shift)
+        let tabDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(kVK_Tab))
+        guard panel.isVisible, AppDelegate.cmdIsDown, shiftDown || tabDown else {
+            repeatTimer?.invalidate()
+            repeatTimer = nil
+            return
+        }
+        if shiftDown { panel.selectPrevious() } else { panel.selectNext() }
+    }
+
+    private func schedule(after interval: TimeInterval, repeats: Bool, _ body: @escaping () -> Void) {
+        let timer = Timer(timeInterval: interval, repeats: repeats) { _ in body() }
+        // .common so the repeat keeps ticking while the panel is tracking the mouse.
+        RunLoop.main.add(timer, forMode: .common)
+        repeatTimer = timer
     }
 
     private func setupHotKeys() {
@@ -477,9 +538,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let shiftNow  = flags.contains(.shift)
             let panelUp   = AppDelegate.shared.panel.isVisible
 
-            // Shift pressed while Cmd is held → navigate backwards
+            // Shift pressed while Cmd is held → navigate backwards, and keep going if it's held.
             if AppDelegate.cmdIsDown && cmdNow && shiftNow && !AppDelegate.shiftWasDown && panelUp {
                 AppDelegate.shared.panel.selectPrevious()
+                AppDelegate.shared.scheduleAutoRepeat()
             }
 
             let wasDown = AppDelegate.cmdIsDown
