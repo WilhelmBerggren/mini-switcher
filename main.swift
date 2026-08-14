@@ -106,6 +106,21 @@ private func jumpKey(for window: WindowInfo, taken: inout Set<Character>) -> Jum
     return nil // every letter in this row is already claimed
 }
 
+// MARK: - Selection
+
+// The next row belonging to the same app as `row`, wrapping around the end of the list. This
+// is macOS's ⌘` in list form: once you are on an app, the key walks that app's windows. An app
+// with a single window returns that row again, so the key is a no-op rather than a surprise.
+func nextWindowOfSameApp(in windows: [WindowInfo], after row: Int) -> Int? {
+    guard windows.indices.contains(row) else { return nil }
+    let app = windows[row].appName
+    for step in 1...windows.count {
+        let candidate = (row + step) % windows.count
+        if windows[candidate].appName == app { return candidate }
+    }
+    return nil
+}
+
 // MARK: - Window Discovery
 
 func fetchWindows() -> [WindowInfo] {
@@ -597,7 +612,17 @@ final class SwitcherPanel: NSPanel {
 
     private func select(by delta: Int) {
         guard !windows.isEmpty else { return }
-        let row = (table.selectedRow + delta + windows.count) % windows.count
+        select(row: (table.selectedRow + delta + windows.count) % windows.count)
+    }
+
+    // Steps through the windows of the app you are already on, the way ⌘` does elsewhere.
+    private func cycleWithinApp() {
+        guard let row = nextWindowOfSameApp(in: windows, after: max(table.selectedRow, 0))
+        else { return }
+        select(row: row)
+    }
+
+    private func select(row: Int) {
         baseSelectedRow = row
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
@@ -631,22 +656,33 @@ final class SwitcherPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
 
+    // The key above Tab: ` on ANSI keyboards, § on ISO ones. macOS puts its own
+    // cycle-this-app's-windows shortcut on that physical key, so match the key rather than
+    // the character it happens to print.
+    private static let cycleKeyCodes = [kVK_ANSI_Grave, kVK_ISO_Section]
+
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
         case kVK_Escape:    orderOut(nil)
         case kVK_Return:    commitAndClose()
         case kVK_UpArrow:   selectPrevious()
         case kVK_DownArrow: selectNext()
+        case let code where SwitcherPanel.cycleKeyCodes.contains(code): cycleWithinApp()
         default:
             guard !jump(with: event) else { return }
             super.keyDown(with: event)
         }
     }
 
-    // ⌘ is normally still held when a jump key is typed, and AppKit routes ⌘-modified keys
-    // to performKeyEquivalent rather than keyDown — so the letters have to be caught here too.
+    // ⌘ is normally still held when one of these is typed, and AppKit routes ⌘-modified keys
+    // to performKeyEquivalent rather than keyDown — so they have to be caught here too.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        isVisible && jump(with: event) ? true : super.performKeyEquivalent(with: event)
+        guard isVisible else { return super.performKeyEquivalent(with: event) }
+        if SwitcherPanel.cycleKeyCodes.contains(Int(event.keyCode)) {
+            cycleWithinApp()
+            return true
+        }
+        return jump(with: event) ? true : super.performKeyEquivalent(with: event)
     }
 
     // Moves the selection only; ⌘ release (or Return) still commits, so a mistyped letter

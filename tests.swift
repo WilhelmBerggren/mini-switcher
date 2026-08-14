@@ -188,6 +188,34 @@ private func testJumpKeyStability(_ t: Tester) {
     t.expect(stable, "every window keeps its key across 12 reorderings of the list")
 }
 
+// MARK: - Cycling Within an App
+
+private func testCycleWithinApp(_ t: Tester) {
+    t.group("nextWindowOfSameApp")
+
+    // Rows of one app are not adjacent — the list is ordered by recency, not grouped.
+    let list = [win("Zed", "a"), win("Slack", "b"), win("Zed", "c"), win("Zed", "d"), win("Signal")]
+    t.expect(nextWindowOfSameApp(in: list, after: 0), 2, "skips past other apps to the next Zed")
+    t.expect(nextWindowOfSameApp(in: list, after: 2), 3, "then on to the one after that")
+    t.expect(nextWindowOfSameApp(in: list, after: 3), 0, "and wraps back to the first")
+    t.expect(nextWindowOfSameApp(in: list, after: 1), 1,
+             "an app with one window returns that row, so the key does nothing")
+    t.expect(nextWindowOfSameApp(in: list, after: 4), 4, "including the last row")
+
+    t.expect(nextWindowOfSameApp(in: [], after: 0) == nil, "an empty list has nothing to cycle")
+    t.expect(nextWindowOfSameApp(in: list, after: 9) == nil, "a row out of range yields nothing")
+    t.expect(nextWindowOfSameApp(in: list, after: -1) == nil, "as does no selection at all")
+
+    // Grouping is by app name, so two processes of one app cycle together — which is what
+    // the row labels say, both reading "Firefox".
+    let twoProcesses = [
+        WindowInfo(id: 1, pid: 100, appName: "Firefox", title: "one", isMinimized: false),
+        WindowInfo(id: 2, pid: 200, appName: "Firefox", title: "two", isMinimized: false),
+    ]
+    t.expect(nextWindowOfSameApp(in: twoProcesses, after: 0), 1,
+             "two processes of the same app are one app here")
+}
+
 // MARK: - Ordering
 
 // Drives orderedByRecentUse the way the panel does: each call is one press of the switcher,
@@ -257,6 +285,7 @@ func runTests() -> Bool {
     testJumpKeys(t)
     testJumpKeyUnderlines(t)
     testJumpKeyStability(t)
+    testCycleWithinApp(t)
     testOrdering(t)
     return t.summary()
 }
