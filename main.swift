@@ -44,7 +44,13 @@ struct WindowInfo {
     let appName: String
     let title: String
     let isMinimized: Bool
-    var label: String { title.isEmpty ? appName : "\(title) — \(appName)" }
+    // Single-window apps often title their window after themselves ("Claude — Claude"), and
+    // the app name is all we have for a window on another Space, so both collapse to one name.
+    var label: String {
+        title.isEmpty || title.caseInsensitiveCompare(appName) == .orderedSame
+            ? appName
+            : "\(title) — \(appName)"
+    }
 }
 
 // MARK: - Window Discovery
