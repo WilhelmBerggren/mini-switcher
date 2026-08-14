@@ -85,9 +85,10 @@ After the first `make run`, grant Accessibility access when prompted, then trigg
 Builds are published to [GitHub Releases](https://github.com/WilhelmBerggren/fonsterbyte/releases)
 with the `gh` CLI. To cut a new release (e.g. `v0.1.2`):
 
-1. **Commit and push** everything you want in the release; make sure `main` is
-   in sync with `origin` (`git push`). The release tag points at the current
-   `main` commit.
+1. **Bump `VERSION` in the `Makefile`**, then commit and push everything you want
+   in the release; make sure `main` is in sync with `origin` (`git push`). The
+   release tag points at the current `main` commit. `make build` stamps `VERSION`
+   into the bundle, so the tag, `Get Info` and the Homebrew cask all agree.
 2. **Build a fresh bundle and zip it.** Use `ditto` (not `zip`) so the `.app`
    structure and ad-hoc signature are preserved:
    ```sh

@@ -2,6 +2,10 @@ APP       = Fonsterbyte
 BUNDLE    = $(APP).app
 BIN       = $(BUNDLE)/Contents/MacOS/$(APP)
 BUNDLE_ID = com.local.fonsterbyte
+# The version the next release will carry. Bump this first when cutting one: the build stamps
+# it into the bundle, so what Finder reports matches the release tag and the Homebrew cask.
+# Info.plist holds a placeholder, since only a built bundle has a meaningful version.
+VERSION   = 0.1.7
 
 .PHONY: build run test clean
 
@@ -15,6 +19,10 @@ build: AppIcon.icns
 	cp $(APP) $(BIN)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp AppIcon.icns $(BUNDLE)/Contents/Resources/
+	# Stamp the version into the copied plist, never the source. This must happen before
+	# the signature below — editing anything inside the bundle afterwards invalidates it.
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" \
+		-c "Set :CFBundleVersion $(VERSION)" $(BUNDLE)/Contents/Info.plist
 	# Override the designated requirement to use the bundle identifier rather than
 	# the binary hash, so TCC persists the accessibility grant across rebuilds.
 	codesign --force --deep --sign - \
