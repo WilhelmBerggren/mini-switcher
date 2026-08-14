@@ -3,7 +3,7 @@ BUNDLE    = $(APP).app
 BIN       = $(BUNDLE)/Contents/MacOS/$(APP)
 BUNDLE_ID = com.local.fonsterbyte
 
-.PHONY: build run clean
+.PHONY: build run test clean
 
 # Generate once; only reruns if generate_icon.swift is newer than the .icns.
 AppIcon.icns: generate_icon.swift
@@ -25,5 +25,12 @@ build: AppIcon.icns
 run: build
 	open $(BUNDLE)
 
+# Swift permits top-level code in main.swift only, so the tests cannot be their own program
+# without a second module. Instead they are compiled into this one and -DTESTS hands them the
+# entry point; the app build never sees tests.swift.
+test:
+	swiftc -DTESTS main.swift tests.swift -o .$(APP)-tests
+	./.$(APP)-tests
+
 clean:
-	rm -rf $(APP) $(BUNDLE) AppIcon.icns
+	rm -rf $(APP) $(BUNDLE) AppIcon.icns .$(APP)-tests

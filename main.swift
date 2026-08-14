@@ -177,7 +177,9 @@ func fetchWindows() -> [WindowInfo] {
     // Window IDs are not reused, so anything not listed this time is gone for good.
     titleCache = titleCache.filter { seenIDs.contains($0.key) }
     knownAXWindows = knownAXWindows.filter { seenIDs.contains($0.key) }
-    return orderByRecentUse(current: current, others: others)
+    let ordered = orderedByRecentUse(current: current, others: others, remembered: mruOrder)
+    mruOrder = ordered.map(\.id)
+    return ordered
 }
 
 // The order the switcher last presented, most-recently-used first.
@@ -190,13 +192,17 @@ private var mruOrder: [CGWindowID] = []
 // Windows of the active Space fill their remembered slots in live z-order, so raising one by
 // any means (clicking it, another switcher) still ranks it correctly; windows elsewhere keep
 // the position they had. With everything on one Space this reduces to plain z-order.
-private func orderByRecentUse(current: [WindowInfo], others: [WindowInfo]) -> [WindowInfo] {
+//
+// `remembered` is the previous result, passed in rather than read from the global so the whole
+// thing stays a pure function of its inputs — which is what makes a sequence of switches testable.
+func orderedByRecentUse(current: [WindowInfo], others: [WindowInfo],
+                        remembered: [CGWindowID]) -> [WindowInfo] {
     let currentIDs = Set(current.map(\.id))
     var pending = Dictionary(uniqueKeysWithValues: others.map { ($0.id, $0) })
     var zOrder = current[...]
     var result: [WindowInfo] = []
 
-    for id in mruOrder {
+    for id in remembered {
         if currentIDs.contains(id) {
             if let next = zOrder.popFirst() { result.append(next) }
         } else if let window = pending.removeValue(forKey: id) {
@@ -213,14 +219,13 @@ private func orderByRecentUse(current: [WindowInfo], others: [WindowInfo]) -> [W
         result.insert(result.remove(at: i), at: 0)
     }
 
-    mruOrder = result.map(\.id)
     return result
 }
 
 // Shared filter for a CGWindowListCopyWindowInfo entry: a normal (non-panel, non-menu) window
 // that is actually drawn. The alpha test matters for full-screen apps — Firefox leaves a
 // transparent full-width strip on screen that would otherwise list as a titleless entry.
-private func switchableWindow(_ d: [CFString: Any], myPID: pid_t)
+func switchableWindow(_ d: [CFString: Any], myPID: pid_t)
     -> (id: CGWindowID, pid: pid_t, app: String)? {
     guard let layer = d[kCGWindowLayer]     as? Int, layer == 0,
           let pidInt = d[kCGWindowOwnerPID] as? Int,
@@ -808,7 +813,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Entry Point
 
+// Swift allows top-level code in main.swift only, so `make test` compiles tests.swift
+// alongside this file with -DTESTS and takes the entry point over. `make build` passes
+// neither, so the app binary is exactly what it always was.
+#if TESTS
+exit(runTests() ? EXIT_SUCCESS : EXIT_FAILURE)
+#else
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+#endif

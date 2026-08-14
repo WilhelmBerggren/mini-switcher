@@ -43,8 +43,15 @@ window with its title and icon, and raise the one you pick.
 ```sh
 make build   # compile main.swift and assemble Fonsterbyte.app
 make run     # build, then launch the app
+make test    # run the tests in tests.swift
 make clean   # remove build artifacts
 ```
+
+`make test` compiles `tests.swift` together with `main.swift` under `-DTESTS`, which hands
+the entry point to the test runner instead of `NSApplication`. Swift allows top-level code
+in `main.swift` only, so this keeps the tests in one plain file with no test bundle, package
+manifest or XCTest dependency. They cover labelling, window-list filtering, jump-key
+assignment and list ordering — the parts that don't need a live window server.
 
 `make build` compiles `main.swift`, generates the app icon from an SF Symbol
 (once, via `generate_icon.swift`), assembles `Fonsterbyte.app`, and ad-hoc
