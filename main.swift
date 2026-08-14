@@ -53,6 +53,54 @@ struct WindowInfo {
     }
 }
 
+// MARK: - Jump Keys
+
+// The type-ahead letter for one row, and where to underline it in the row's label.
+struct JumpKey {
+    let key: Character  // lowercased — what the user types
+    let offset: Int     // character offset into `label`
+}
+
+// Assigns each row a letter, unique across the list, in two passes: every app picks once
+// before any app picks twice. Otherwise a run of windows from one app eats the initials of
+// apps further down — three Zed windows would take "z", "e", "d" and leave DBeaver on "b".
+//
+// Claims are made in alphabetical order, never list order. The list is sorted by recency, so
+// letting it drive the claims would hand "s" to whichever of Slack and Signal you used last;
+// going alphabetically means a letter keeps belonging to the same window between switches.
+func assignJumpKeys(_ windows: [WindowInfo]) -> [JumpKey?] {
+    var taken = Set<Character>()
+    var keys = [JumpKey?](repeating: nil, count: windows.count)
+    let alphabetical = windows.indices.sorted {
+        (windows[$0].appName.lowercased(), windows[$0].label.lowercased(), $0)
+            < (windows[$1].appName.lowercased(), windows[$1].label.lowercased(), $1)
+    }
+
+    var appsWithAPick = Set<String>()
+    for row in alphabetical where appsWithAPick.insert(windows[row].appName).inserted {
+        keys[row] = jumpKey(for: windows[row], taken: &taken)
+    }
+    for row in alphabetical where keys[row] == nil {
+        keys[row] = jumpKey(for: windows[row], taken: &taken)
+    }
+    return keys
+}
+
+// The best letter still going for one row. Preference goes to the app name: you reach for
+// "s" thinking of Slack, not of the channel name its title happens to start with.
+private func jumpKey(for window: WindowInfo, taken: inout Set<Character>) -> JumpKey? {
+    let chars = Array(window.label)
+    // A label is either the app name alone or "title — appName", so the app name is always
+    // the tail; searching it first needs no string matching.
+    let appStart = max(0, chars.count - window.appName.count)
+    for i in Array(appStart..<chars.count) + Array(0..<appStart) {
+        guard let c = chars[i].lowercased().first, c.isLetter || c.isNumber,
+              taken.insert(c).inserted else { continue }
+        return JumpKey(key: c, offset: i)
+    }
+    return nil // every letter in this row is already claimed
+}
+
 // MARK: - Window Discovery
 
 func fetchWindows() -> [WindowInfo] {
@@ -315,8 +363,20 @@ final class WindowCell: NSTableCellView {
 
     required init?(coder: NSCoder) { nil }
 
-    func configure(with window: WindowInfo) {
-        textField?.stringValue = window.label
+    func configure(with window: WindowInfo, jump: JumpKey?) {
+        let label = window.label
+        if let jump, jump.offset < label.count {
+            // No colour is set, so the text still inverts with the selection like a plain
+            // string would; only the font has to be restated for the attributed path.
+            let text = NSMutableAttributedString(
+                string: label, attributes: [.font: NSFont.systemFont(ofSize: 14)])
+            let start = label.index(label.startIndex, offsetBy: jump.offset)
+            text.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue,
+                              range: NSRange(start..<label.index(after: start), in: label))
+            textField?.attributedStringValue = text
+        } else {
+            textField?.stringValue = label
+        }
         iconView.image = NSRunningApplication(processIdentifier: window.pid)?.icon
         // Dim minimized windows so they read as inactive (selecting one un-minimizes it).
         iconView.alphaValue = window.isMinimized ? 0.4 : 1.0
@@ -377,6 +437,8 @@ final class SwitcherPanel: NSPanel {
 
     private let table = HoverTableView()
     private var windows: [WindowInfo] = []
+    private var jumpKeys: [JumpKey?] = []       // parallel to `windows`
+    private var jumpRows: [Character: Int] = [:] // typed letter → row
     // The keyboard/⌘-driven selection. Hover changes the visible selection as a preview
     // only; if the cursor leaves the list without committing, we revert to this row.
     private var baseSelectedRow = 0
@@ -448,6 +510,9 @@ final class SwitcherPanel: NSPanel {
     func present(selectIndex: Int = 0) {
         windows = fetchWindows()
         guard !windows.isEmpty else { return }
+        jumpKeys = assignJumpKeys(windows)
+        jumpRows = [:]
+        for (row, jump) in jumpKeys.enumerated() where jump != nil { jumpRows[jump!.key] = row }
         table.reloadData()
 
         // Size the window first, so the row scroll below is computed against the final clip height.
@@ -518,8 +583,27 @@ final class SwitcherPanel: NSPanel {
         case kVK_Return:    commitAndClose()
         case kVK_UpArrow:   selectPrevious()
         case kVK_DownArrow: selectNext()
-        default:            super.keyDown(with: event)
+        default:
+            guard !jump(with: event) else { return }
+            super.keyDown(with: event)
         }
+    }
+
+    // ⌘ is normally still held when a jump key is typed, and AppKit routes ⌘-modified keys
+    // to performKeyEquivalent rather than keyDown — so the letters have to be caught here too.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        isVisible && jump(with: event) ? true : super.performKeyEquivalent(with: event)
+    }
+
+    // Moves the selection only; ⌘ release (or Return) still commits, so a mistyped letter
+    // costs nothing.
+    private func jump(with event: NSEvent) -> Bool {
+        guard let typed = event.charactersIgnoringModifiers?.lowercased().first,
+              let row = jumpRows[typed] else { return false }
+        baseSelectedRow = row
+        table.selectRowIndexes([row], byExtendingSelection: false)
+        table.scrollRowToVisible(row)
+        return true
     }
 }
 
@@ -532,7 +616,7 @@ extension SwitcherPanel: NSTableViewDelegate {
         let cell = t.makeView(withIdentifier: WindowCell.id, owner: nil) as? WindowCell
             ?? WindowCell(frame: .zero)
         cell.identifier = WindowCell.id
-        cell.configure(with: windows[row])
+        cell.configure(with: windows[row], jump: jumpKeys[row])
         return cell
     }
 
