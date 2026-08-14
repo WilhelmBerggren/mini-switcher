@@ -74,6 +74,16 @@ private func testLabels(_ t: Tester) {
              "the two name sources disagree on case, so the match ignores it")
     t.expect(win("Slack", "Slack — Slack").label, "Slack — Slack — Slack",
              "only an exact match collapses; a title that merely contains it is left alone")
+
+    // The row is drawn from these two pieces, and jump-key offsets are measured against their
+    // concatenation — so a split that didn't rebuild the label would underline the wrong letter.
+    t.expect(win("Zed", "main.swift").titlePart, "main.swift", "the title piece is the title")
+    t.expect(win("Zed", "main.swift").appPart, " — Zed", "the app piece carries the separator")
+    t.expect(win("Claude", "Claude").titlePart, "", "a collapsed row has no title piece")
+    t.expect(win("Claude", "Claude").appPart, "Claude", "and its app piece is the whole row")
+    for w in [win("Zed", "main.swift"), win("Claude", "Claude"), win("Firefox")] {
+        t.expect(w.titlePart + w.appPart, w.label, "the pieces reassemble into \"\(w.label)\"")
+    }
 }
 
 // MARK: - Window List Filtering

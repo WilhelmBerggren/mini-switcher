@@ -46,11 +46,16 @@ struct WindowInfo {
     let isMinimized: Bool
     // Single-window apps often title their window after themselves ("Claude — Claude"), and
     // the app name is all we have for a window on another Space, so both collapse to one name.
-    var label: String {
-        title.isEmpty || title.caseInsensitiveCompare(appName) == .orderedSame
-            ? appName
-            : "\(title) — \(appName)"
+    private var showsTitle: Bool {
+        !title.isEmpty && title.caseInsensitiveCompare(appName) != .orderedSame
     }
+
+    // A row is drawn as these two pieces, so that a title too long for the row can be
+    // truncated on its own and the app name always stays readable. Their concatenation is
+    // `label`, which is what jump-key offsets are measured against.
+    var titlePart: String { showsTitle ? title : "" }
+    var appPart: String { showsTitle ? " — \(appName)" : appName }
+    var label: String { titlePart + appPart }
 }
 
 // MARK: - Jump Keys
@@ -341,6 +346,10 @@ func raiseWindow(_ w: WindowInfo) {
 final class WindowCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("WindowCell")
     private let iconView = NSImageView()
+    // Two labels rather than one: only this way can the row give up title text while keeping
+    // the app name, which is both the thing you scan for and where the jump key is underlined.
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let appLabel = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -348,43 +357,83 @@ final class WindowCell: NSTableCellView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(iconView)
 
-        let tf = NSTextField(labelWithString: "")
-        tf.font = .systemFont(ofSize: 14)
-        tf.lineBreakMode = .byTruncatingTail
-        tf.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(tf)
-        textField = tf
+        for label in [titleLabel, appLabel] {
+            label.font = .systemFont(ofSize: 14)
+            label.lineBreakMode = .byTruncatingTail
+            // A row is one line tall, so text too long for it has to end in an ellipsis
+            // rather than wrap into a second line the row has no room to show.
+            label.usesSingleLineMode = true
+            label.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(label)
+        }
+        // Neither label stretches past its text, and when the row is too narrow the title is
+        // the one that gives — the app name resists being squeezed at all, so it survives whole.
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        appLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        appLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        textField = titleLabel
 
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 24),
             iconView.heightAnchor.constraint(equalToConstant: 24),
-            tf.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-            tf.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            tf.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            appLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            appLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            appLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
         ])
     }
 
     required init?(coder: NSCoder) { nil }
 
-    func configure(with window: WindowInfo, jump: JumpKey?) {
-        let label = window.label
-        if let jump, jump.offset < label.count {
-            // No colour is set, so the text still inverts with the selection like a plain
-            // string would; only the font has to be restated for the attributed path.
-            let text = NSMutableAttributedString(
-                string: label, attributes: [.font: NSFont.systemFont(ofSize: 14)])
-            let start = label.index(label.startIndex, offsetBy: jump.offset)
-            text.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue,
-                              range: NSRange(start..<label.index(after: start), in: label))
-            textField?.attributedStringValue = text
-        } else {
-            textField?.stringValue = label
+    // NSTableCellView only hands the selection's background style to its `textField` outlet,
+    // so the second label would keep dark text on a highlighted row without this.
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            titleLabel.cell?.backgroundStyle = backgroundStyle
+            appLabel.cell?.backgroundStyle = backgroundStyle
         }
+    }
+
+    // An attributed string carries its own paragraph style, and the default one wraps —
+    // overriding the text field's truncation. So the attributed path has to restate it.
+    private static let truncating: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        return style
+    }()
+
+    func configure(with window: WindowInfo, jump: JumpKey?) {
+        // A jump key's offset is into `label`, which is the two pieces concatenated, so it
+        // belongs to whichever piece that offset falls in.
+        let split = window.titlePart.count
+        let offset = jump?.offset
+        titleLabel.attributedStringValue = WindowCell.styled(
+            window.titlePart, underlinedAt: offset.flatMap { $0 < split ? $0 : nil })
+        appLabel.attributedStringValue = WindowCell.styled(
+            window.appPart, underlinedAt: offset.flatMap { $0 >= split ? $0 - split : nil })
+
         iconView.image = NSRunningApplication(processIdentifier: window.pid)?.icon
         // Dim minimized windows so they read as inactive (selecting one un-minimizes it).
         iconView.alphaValue = window.isMinimized ? 0.4 : 1.0
+    }
+
+    // No colour is set, so the text still inverts with the selection like a plain string
+    // would; font and truncation are all the attributed path has to restate.
+    private static func styled(_ text: String, underlinedAt offset: Int?) -> NSAttributedString {
+        let styled = NSMutableAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 14),
+            .paragraphStyle: truncating,
+        ])
+        if let offset, offset < text.count {
+            let start = text.index(text.startIndex, offsetBy: offset)
+            styled.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue,
+                                range: NSRange(start..<text.index(after: start), in: text))
+        }
+        return styled
     }
 }
 
