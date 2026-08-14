@@ -122,6 +122,7 @@ func fetchWindows() -> [WindowInfo] {
 
     // Window IDs are not reused, so anything not listed this time is gone for good.
     titleCache = titleCache.filter { seenIDs.contains($0.key) }
+    knownAXWindows = knownAXWindows.filter { seenIDs.contains($0.key) }
     return orderByRecentUse(current: current, others: others)
 }
 
@@ -204,26 +205,41 @@ private func axWindows(pid: pid_t, cache: inout [pid_t: [AXUIElement]]) -> [AXUI
     return wins
 }
 
+// Remembered AX handles, one per window. kAXWindowsAttribute only ever lists the active
+// Space, but a handle obtained from it keeps working once its window moves out of view —
+// which is the only way to act on a specific window on another Space. Without it, all we
+// could do is activate the app, and the app decides which of its windows that means.
+private var knownAXWindows: [CGWindowID: AXUIElement] = [:]
+
 // A window on another Space has no readable title at all: AX reports only the active Space,
 // and the window server's title property comes back empty on recent macOS. Titles seen while
 // a window was reachable are kept here so it still reads as more than a bare app name later.
 private var titleCache: [CGWindowID: String] = [:]
 
-// Best-effort title: AX first (most reliable), CGS window-server property, then last-known.
-private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
-                         cache: inout [pid_t: [AXUIElement]]) -> String {
-    // AX title (requires Accessibility permission).
+// The AX handle for one window: found live if its Space is active, else the remembered one.
+private func axWindow(pid: pid_t, winID: CGWindowID,
+                      cache: inout [pid_t: [AXUIElement]]) -> AXUIElement? {
     if AXIsProcessTrusted() {
         for axWin in axWindows(pid: pid, cache: &cache) {
             var id = CGWindowID(0)
             guard _AXUIElementGetWindow(axWin, &id) == .success, id == winID else { continue }
-            var tRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &tRef) == .success,
-               let t = tRef as? String, !t.isEmpty {
-                titleCache[winID] = t
-                return t
-            }
-            break
+            knownAXWindows[winID] = axWin
+            return axWin
+        }
+    }
+    return knownAXWindows[winID]
+}
+
+// Best-effort title: AX first (most reliable), CGS window-server property, then last-known.
+private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
+                         cache: inout [pid_t: [AXUIElement]]) -> String {
+    // AX title (requires Accessibility permission).
+    if let axWin = axWindow(pid: pid, winID: winID, cache: &cache) {
+        var tRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &tRef) == .success,
+           let t = tRef as? String, !t.isEmpty {
+            titleCache[winID] = t
+            return t
         }
     }
 
@@ -242,18 +258,15 @@ private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
 // MARK: - Window Activation
 
 func raiseWindow(_ w: WindowInfo) {
-    let axApp = AXUIElementCreateApplication(w.pid)
-    var ref: CFTypeRef?
-    if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
-       let wins = ref as? [AXUIElement] {
-        for axWin in wins {
-            var id = CGWindowID(0)
-            guard _AXUIElementGetWindow(axWin, &id) == .success, id == w.id else { continue }
-            AXUIElementSetAttributeValue(axWin, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-            AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
-            break
-        }
+    // Raise before activating: activation follows the app's main window, so making the chosen
+    // window main first is what stops an app with several windows from landing on the wrong
+    // one. For a window on another Space this only works via the remembered AX handle — the
+    // live lookup returns nothing there, which is exactly when picking the wrong window shows.
+    var cache: [pid_t: [AXUIElement]] = [:]
+    if let axWin = axWindow(pid: w.pid, winID: w.id, cache: &cache) {
+        AXUIElementSetAttributeValue(axWin, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
     }
     if let runningApp = NSRunningApplication(processIdentifier: w.pid) {
         if #available(macOS 14.0, *) {
