@@ -15,6 +15,16 @@ typealias CGSConnectionID = UInt32
 func CGSCopyWindowProperty(_ cid: CGSConnectionID, _ wid: CGWindowID,
                             _ property: CFString, _ value: UnsafeMutablePointer<CFTypeRef?>) -> CGError
 
+// Space enumeration. CGWindowListCopyWindowInfo cannot tell a real window sitting on another
+// Space apart from an app's never-shown placeholder window — both are simply "not on screen".
+// The window server knows: only real windows are placed in a Space.
+@_silgen_name("CGSCopyManagedDisplaySpaces")
+func CGSCopyManagedDisplaySpaces(_ cid: CGSConnectionID) -> Unmanaged<CFArray>?
+@_silgen_name("CGSCopyWindowsWithOptionsAndTags")
+func CGSCopyWindowsWithOptionsAndTags(_ cid: CGSConnectionID, _ owner: UInt32, _ spaces: CFArray,
+                                       _ options: UInt32, _ setTags: UnsafeMutablePointer<UInt64>,
+                                       _ clearTags: UnsafeMutablePointer<UInt64>) -> Unmanaged<CFArray>?
+
 // Maps an AXUIElement to its CGWindowID. The "AXWindowID" attribute does NOT exist
 // in the public AX API — this private symbol is the only reliable way to correlate
 // an AX window with a window from CGWindowListCopyWindowInfo.
@@ -46,55 +56,140 @@ func fetchWindows() -> [WindowInfo] {
     // AXUIElementCreateApplication + kAXWindowsAttribute is expensive; cache per pid
     // so apps with many windows aren't queried repeatedly.
     var axWindowCache: [pid_t: [AXUIElement]] = [:]
-    var result: [WindowInfo] = []
+    // Windows of the active Space carry live z-order; everything else has to be ranked from
+    // the remembered order, so the two are collected separately and merged at the end.
+    var current: [WindowInfo] = []
+    var others: [WindowInfo] = []
 
-    // 1. On-screen windows, in front-to-back z-order. Minimized windows are excluded
-    //    from this list (they aren't on screen), so they're handled in pass 2.
+    // 1. On-screen windows of the active Space, in front-to-back z-order. This is the only
+    //    list that carries z-order, which is what makes ⌘Tab land on the previous window.
     if let list = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
     ) as? [[CFString: Any]] {
         for d in list {
-            guard
-                let layer  = d[kCGWindowLayer]    as? Int,    layer == 0,
-                let pidInt = d[kCGWindowOwnerPID] as? Int,    pid_t(pidInt) != myPID,
-                let winID  = d[kCGWindowNumber]   as? CGWindowID,
-                let app    = d[kCGWindowOwnerName] as? String,
-                seenIDs.insert(winID).inserted
+            guard let w = switchableWindow(d, myPID: myPID), seenIDs.insert(w.id).inserted
             else { continue }
-
-            let pid = pid_t(pidInt)
-            let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
-            result.append(WindowInfo(id: winID, pid: pid, appName: app, title: title, isMinimized: false))
+            let title = windowTitle(pid: w.pid, winID: w.id, conn: conn, cache: &axWindowCache)
+            current.append(WindowInfo(id: w.id, pid: w.pid, appName: w.app,
+                                      title: title, isMinimized: false))
         }
     }
 
-    // 2. Everything pass 1 cannot see, appended after it: minimized windows, and windows
-    //    on other Spaces — .optionOnScreenOnly is current-Space only, so a full-screen app
-    //    or another desktop's windows never appear there. AX reports every window an app
-    //    owns regardless of Space or minimized state.
+    // 2. Minimized windows, found via the AX API (which still sees them), appended after.
     if AXIsProcessTrusted() {
         for app in NSWorkspace.shared.runningApplications
         where app.activationPolicy == .regular && app.processIdentifier != myPID {
             let pid = app.processIdentifier
             for axWin in axWindows(pid: pid, cache: &axWindowCache) {
-                var winID = CGWindowID(0)
-                guard _AXUIElementGetWindow(axWin, &winID) == .success,
-                      isStandardWindow(axWin),
-                      seenIDs.insert(winID).inserted else { continue }
-
                 var minRef: CFTypeRef?
-                let minimized = AXUIElementCopyAttributeValue(
-                    axWin, kAXMinimizedAttribute as CFString, &minRef) == .success
-                    && (minRef as? Bool) == true
+                guard AXUIElementCopyAttributeValue(axWin, kAXMinimizedAttribute as CFString, &minRef) == .success,
+                      (minRef as? Bool) == true else { continue }
+                var winID = CGWindowID(0)
+                guard _AXUIElementGetWindow(axWin, &winID) == .success, seenIDs.insert(winID).inserted else { continue }
 
                 let title = windowTitle(pid: pid, winID: winID, conn: conn, cache: &axWindowCache)
-                result.append(WindowInfo(id: winID, pid: pid, appName: app.localizedName ?? "",
-                                         title: title, isMinimized: minimized))
+                others.append(WindowInfo(id: winID, pid: pid, appName: app.localizedName ?? "",
+                                         title: title, isMinimized: true))
             }
         }
     }
 
+    // 3. Windows on other Spaces — another desktop, or an app that went full-screen (which
+    //    gives it a Space of its own). Neither earlier pass can see them: .optionOnScreenOnly
+    //    covers the active Space only, and kAXWindowsAttribute returns nothing for an app
+    //    whose windows are all elsewhere. So take the unfiltered window list and keep the
+    //    entries the window server has actually placed in a Space, which is what separates
+    //    a real window on another desktop from an app's never-shown placeholder window.
+    let spaceWindows = windowsInAllSpaces(conn: conn)
+    if !spaceWindows.isEmpty,
+       let list = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+        as? [[CFString: Any]] {
+        // Helper processes ("Firefox GPU Help", "AutoFill") own layer-0 windows too; only
+        // ordinary foreground apps can own a window worth switching to.
+        let regularPIDs = Set(NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .map { $0.processIdentifier })
+        for d in list {
+            guard let w = switchableWindow(d, myPID: myPID),
+                  spaceWindows.contains(w.id), regularPIDs.contains(w.pid),
+                  seenIDs.insert(w.id).inserted
+            else { continue }
+            let title = windowTitle(pid: w.pid, winID: w.id, conn: conn, cache: &axWindowCache)
+            others.append(WindowInfo(id: w.id, pid: w.pid, appName: w.app,
+                                     title: title, isMinimized: false))
+        }
+    }
+
+    // Window IDs are not reused, so anything not listed this time is gone for good.
+    titleCache = titleCache.filter { seenIDs.contains($0.key) }
+    return orderByRecentUse(current: current, others: others)
+}
+
+// The order the switcher last presented, most-recently-used first.
+private var mruOrder: [CGWindowID] = []
+
+// Ranks every window by how recently it was used. The window server only exposes z-order for
+// the active Space, so a window on another desktop carries no hint of its own — without a
+// memory it can only be appended last, however recently you were in it.
+//
+// Windows of the active Space fill their remembered slots in live z-order, so raising one by
+// any means (clicking it, another switcher) still ranks it correctly; windows elsewhere keep
+// the position they had. With everything on one Space this reduces to plain z-order.
+private func orderByRecentUse(current: [WindowInfo], others: [WindowInfo]) -> [WindowInfo] {
+    let currentIDs = Set(current.map(\.id))
+    var pending = Dictionary(uniqueKeysWithValues: others.map { ($0.id, $0) })
+    var zOrder = current[...]
+    var result: [WindowInfo] = []
+
+    for id in mruOrder {
+        if currentIDs.contains(id) {
+            if let next = zOrder.popFirst() { result.append(next) }
+        } else if let window = pending.removeValue(forKey: id) {
+            result.append(window)
+        }
+        // Anything else has been closed since we last looked.
+    }
+    result += zOrder                                        // opened since the last look
+    result += others.filter { pending[$0.id] != nil }       // ditto, and not on this Space
+
+    // Whatever is frontmost in the active Space is what the user is looking at right now, so
+    // it heads the list — this is what puts the Space you just came from second, not last.
+    if let front = current.first, let i = result.firstIndex(where: { $0.id == front.id }), i > 0 {
+        result.insert(result.remove(at: i), at: 0)
+    }
+
+    mruOrder = result.map(\.id)
     return result
+}
+
+// Shared filter for a CGWindowListCopyWindowInfo entry: a normal (non-panel, non-menu) window
+// that is actually drawn. The alpha test matters for full-screen apps — Firefox leaves a
+// transparent full-width strip on screen that would otherwise list as a titleless entry.
+private func switchableWindow(_ d: [CFString: Any], myPID: pid_t)
+    -> (id: CGWindowID, pid: pid_t, app: String)? {
+    guard let layer = d[kCGWindowLayer]     as? Int, layer == 0,
+          let pidInt = d[kCGWindowOwnerPID] as? Int,
+          let id    = d[kCGWindowNumber]    as? CGWindowID,
+          let app   = d[kCGWindowOwnerName] as? String,
+          (d[kCGWindowAlpha] as? Double ?? 1) > 0,
+          pid_t(pidInt) != myPID
+    else { return nil }
+    return (id, pid_t(pidInt), app)
+}
+
+// Every window the window server has placed in a Space, on all displays and all Spaces.
+private func windowsInAllSpaces(conn: CGSConnectionID) -> Set<CGWindowID> {
+    guard let displays = CGSCopyManagedDisplaySpaces(conn)?.takeRetainedValue() as? [NSDictionary]
+    else { return [] }
+    let spaceIDs = displays.flatMap { display in
+        (display["Spaces"] as? [NSDictionary] ?? []).compactMap { $0["id64"] as? UInt64 }
+    }
+    guard !spaceIDs.isEmpty else { return [] }
+    var setTags: UInt64 = 0, clearTags: UInt64 = 0
+    guard let ids = CGSCopyWindowsWithOptionsAndTags(
+        conn, 0, spaceIDs as CFArray, 0, &setTags, &clearTags
+    )?.takeRetainedValue() as? [CGWindowID] else { return [] }
+    return Set(ids)
 }
 
 // Per-app AX window list, cached (the lookup is expensive and reused across passes).
@@ -109,16 +204,12 @@ private func axWindows(pid: pid_t, cache: inout [pid_t: [AXUIElement]]) -> [AXUI
     return wins
 }
 
-// Keeps sheets, popovers and tool palettes out of the list. Apps that report no subrole at
-// all are let through — dropping them would lose windows the minimized pass used to show.
-private func isStandardWindow(_ axWin: AXUIElement) -> Bool {
-    var ref: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(axWin, kAXSubroleAttribute as CFString, &ref) == .success,
-          let subrole = ref as? String else { return true }
-    return subrole == (kAXStandardWindowSubrole as String)
-}
+// A window on another Space has no readable title at all: AX reports only the active Space,
+// and the window server's title property comes back empty on recent macOS. Titles seen while
+// a window was reachable are kept here so it still reads as more than a bare app name later.
+private var titleCache: [CGWindowID: String] = [:]
 
-// Best-effort title: AX first (most reliable), CGS window-server property as fallback.
+// Best-effort title: AX first (most reliable), CGS window-server property, then last-known.
 private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
                          cache: inout [pid_t: [AXUIElement]]) -> String {
     // AX title (requires Accessibility permission).
@@ -129,6 +220,7 @@ private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
             var tRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &tRef) == .success,
                let t = tRef as? String, !t.isEmpty {
+                titleCache[winID] = t
                 return t
             }
             break
@@ -139,7 +231,12 @@ private func windowTitle(pid: pid_t, winID: CGWindowID, conn: CGSConnectionID,
     // (often empty for other apps' windows on recent macOS).
     var cgsRef: CFTypeRef?
     CGSCopyWindowProperty(conn, winID, "kCGSWindowTitle" as CFString, &cgsRef)
-    return cgsRef as? String ?? ""
+    if let t = cgsRef as? String, !t.isEmpty {
+        titleCache[winID] = t
+        return t
+    }
+
+    return titleCache[winID] ?? ""
 }
 
 // MARK: - Window Activation
