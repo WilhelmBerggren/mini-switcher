@@ -496,6 +496,16 @@ final class HoverTableView: NSTableView {
     override func mouseExited(with event: NSEvent) {
         onHoverExit?()
     }
+
+    // NSTableView's own arrow handling clamps at the first and last row, which contradicts
+    // the wrap-around ⌘Tab gives. Hand arrows to the window so one place owns the stepping.
+    // Matched on key code, since ⌘ is normally held and ⌘↑ would otherwise mean scroll-to-top.
+    override func keyDown(with event: NSEvent) {
+        switch Int(event.keyCode) {
+        case kVK_UpArrow, kVK_DownArrow: window?.keyDown(with: event)
+        default: super.keyDown(with: event)
+        }
+    }
 }
 
 // MARK: - Switcher Panel
