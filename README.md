@@ -32,7 +32,8 @@ takes — list every window with its title and icon, and raise the one you pick.
   next rather than shifting around as the list reorders.
 - Press the key above `Tab` (`` ` `` on ANSI keyboards, `§` on ISO ones) to step
   through the windows of the app you are on, the way `` ⌘` `` does elsewhere.
-- `↑`/`↓` to navigate, `Return` to switch, `Esc` to dismiss.
+- `↑`/`↓` to navigate, `Return` to switch, `Esc` to dismiss — Esc cancels the switch
+  even while `⌘` is still held, leaving the front window where it was.
 - **Click any row to switch to it instantly**, even while `⌘` is still held.
   Hovering previews a row and reverts if you leave without picking it.
 - Releasing `⌘` commits the highlighted window — the familiar `⌘Tab` muscle memory.

@@ -511,6 +511,8 @@ final class SwitcherPanel: NSPanel {
     // The keyboard/⌘-driven selection. Hover changes the visible selection as a preview
     // only; if the cursor leaves the list without committing, we revert to this row.
     private var baseSelectedRow = 0
+    // Fires on every show and hide. The delegate uses it to grab ⌘Esc only while we are up.
+    var onVisibilityChange: ((Bool) -> Void)?
 
     convenience init() {
         self.init(
@@ -588,23 +590,37 @@ final class SwitcherPanel: NSPanel {
         let rowsVisible = min(windows.count, SwitcherPanel.maxVisibleRows)
         let height = CGFloat(rowsVisible) * table.rowHeight + SwitcherPanel.padding * 2
         setContentSize(NSSize(width: 560, height: height))
-        centerOnCursorScreen()
+        positionOnCursorScreen()
 
         let row = min(selectIndex, windows.count - 1)
         baseSelectedRow = row
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
         makeKeyAndOrderFront(nil)
+        onVisibilityChange?(true)
     }
+
+    // Every path that takes the panel down funnels through here — Esc, commit, resign-key.
+    override func orderOut(_ sender: Any?) {
+        super.orderOut(sender)
+        onVisibilityChange?(false)
+    }
+
+    // Share of the leftover vertical space left above the panel. Below a half it sits higher
+    // than dead centre, which reads as deliberate and lands nearer where the eye already is.
+    private static let spaceAbove: CGFloat = 2.0 / 5.0
 
     // Appear where the user is looking: the screen holding the cursor. NSWindow.center()
     // would instead use NSScreen.main — the screen with the active window.
-    private func centerOnCursorScreen() {
+    private func positionOnCursorScreen() {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return center() }
+        // Measured against the space the panel leaves free rather than against the screen, so
+        // a long list rises by the same proportion as a short one instead of falling off.
+        let free = max(0, visible.height - frame.height)
         setFrameOrigin(NSPoint(x: visible.midX - frame.width / 2,
-                               y: visible.midY - frame.height / 2))
+                               y: visible.minY + free * (1 - SwitcherPanel.spaceAbove)))
     }
 
     func selectNext()     { select(by: 1) }
@@ -642,6 +658,10 @@ final class SwitcherPanel: NSPanel {
         table.scrollRowToVisible(baseSelectedRow)
     }
 
+    // Cancel: leave the front window where it was. The Cmd-release handler only commits
+    // while the panel is up, so hiding it here is enough to call the whole switch off.
+    func dismiss() { orderOut(nil) }
+
     @objc func commitAndClose() { commit(row: table.selectedRow) }
 
     // Single click commits the clicked row immediately — even while ⌘ is still held,
@@ -663,7 +683,7 @@ final class SwitcherPanel: NSPanel {
 
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
-        case kVK_Escape:    orderOut(nil)
+        case kVK_Escape:    dismiss()
         case kVK_Return:    commitAndClose()
         case kVK_UpArrow:   selectPrevious()
         case kVK_DownArrow: selectNext()
@@ -678,6 +698,10 @@ final class SwitcherPanel: NSPanel {
     // to performKeyEquivalent rather than keyDown — so they have to be caught here too.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard isVisible else { return super.performKeyEquivalent(with: event) }
+        if Int(event.keyCode) == kVK_Escape {
+            dismiss()
+            return true
+        }
         if SwitcherPanel.cycleKeyCodes.contains(Int(event.keyCode)) {
             cycleWithinApp()
             return true
@@ -726,7 +750,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static var cmdIsDown   = false
     static var shiftWasDown = false
     static var hotKeyRef: EventHotKeyRef?
+    static var escHotKeyRef: EventHotKeyRef?
     static var hotKeyHandlerRef: EventHandlerRef?
+
+    private static let hotKeySignature: OSType = 0x4D534E57
+    private static let cycleHotKeyID: UInt32 = 1
+    private static let escapeHotKeyID: UInt32 = 2
 
     private let panel = SwitcherPanel()
     private var statusItem: NSStatusItem!
@@ -741,6 +770,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Must be restored on exit — the effect persists across process restarts.
         setSystemCmdTab(enabled: false)
         setupHotKeys()
+        // ⌘Esc is swallowed before it ever reaches AppKit — no keyDown, no event monitor, even
+        // with the panel key and the app active. A dispatcher-level Carbon hotkey gets in front
+        // of whatever eats it, the same way ⌘Tab does. Held only while the panel is up, so
+        // ⌘Esc keeps whatever meaning it has elsewhere.
+        panel.onVisibilityChange = { AppDelegate.setEscapeHotKey(enabled: $0) }
         setupFlagsMonitor()
         installSignalHandlers()
     }
@@ -749,8 +783,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setSystemCmdTab(enabled: true)
     }
 
-    // Called from the Carbon hotkey handler on the main thread (⌘Tab only).
-    func handleHotKey() {
+    // Called from the Carbon hotkey handler on the main thread.
+    func handleHotKey(_ id: UInt32) {
+        // ⌘Esc: only registered while the panel is up, and it cancels the switch outright.
+        guard id != AppDelegate.escapeHotKeyID else { return panel.dismiss() }
         AppDelegate.cmdIsDown = true
         if panel.isVisible {
             panel.selectNext()
@@ -808,14 +844,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 EventParamName(kEventParamDirectObject),
                 EventParamType(typeEventHotKeyID),
                 nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
-            DispatchQueue.main.async { AppDelegate.shared.handleHotKey() }
+            let pressed = id.id
+            DispatchQueue.main.async { AppDelegate.shared.handleHotKey(pressed) }
             return noErr
         }, 1, &spec, nil, &AppDelegate.hotKeyHandlerRef)
 
-        let sig: OSType = 0x4D534E57
-        let fwdID = EventHotKeyID(signature: sig, id: 1)
+        let fwdID = EventHotKeyID(signature: AppDelegate.hotKeySignature, id: AppDelegate.cycleHotKeyID)
         RegisterEventHotKey(UInt32(kVK_Tab), UInt32(cmdKey),
                             fwdID, target, 0, &AppDelegate.hotKeyRef)
+    }
+
+    // Registered on present, released on hide, so we own ⌘Esc only for the life of the panel.
+    private static func setEscapeHotKey(enabled: Bool) {
+        guard enabled else {
+            if let ref = escHotKeyRef { UnregisterEventHotKey(ref) }
+            escHotKeyRef = nil
+            return
+        }
+        guard escHotKeyRef == nil else { return }
+        let escID = EventHotKeyID(signature: hotKeySignature, id: escapeHotKeyID)
+        RegisterEventHotKey(UInt32(kVK_Escape), UInt32(cmdKey),
+                            escID, GetEventDispatcherTarget(), 0, &escHotKeyRef)
     }
 
     private func setupFlagsMonitor() {
